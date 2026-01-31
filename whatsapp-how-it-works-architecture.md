@@ -45,19 +45,23 @@ Important PM insight:
 - WhatsApp servers act as **routers and temporary storage**
 - They are **not permanent message stores**
 - They cannot read message content due to encryption
+  Sender Device  
+*(Encrypts Message)*  
+&nbsp;  
+│  
+v  
 
-Sender Device
-(Encrypts Message)
-|
-v
-+------------------+
-| WhatsApp Servers |
-| (Routing & Queue)|
-+------------------+
-|
-v
-Recipient Device
-(Decrypts Message)
++------------------------+  
+|     WhatsApp Servers   |  
+|   (Routing & Queue)    |  
++------------------------+  
+
+│  
+v  
+
+Recipient Device  
+*(Decrypts Message)*
+
 
 ---
 
