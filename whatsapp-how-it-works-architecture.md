@@ -7,12 +7,14 @@
 </p>
 
 
+
 # How WhatsApp Works – Product & System Architecture
 
-**Product:** :Whatsapp
-**Audience:** Product Managers/Developers/Curious minds 
+**Product:** WhatsApp  
+**Audience:** Product Managers / Developers / Curious Minds  
 **Goal:** Explain how WhatsApp delivers fast, reliable messaging at massive scale,
 without going deep into infrastructure jargon.
+
 
 ---
 
