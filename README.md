@@ -3,7 +3,7 @@
 Modern software systems are complex.
 Clear explanations of how they actually work are rare.
 
-This repository breaks down real-world tech systems and architectures —
+This repository breaks down real-world tech systems and architectures -
 from first principles to real-world usage.
 
 ## What this repo focuses on
