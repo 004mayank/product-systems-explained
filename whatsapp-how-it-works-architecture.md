@@ -1,3 +1,12 @@
+<p align="center">
+  <img 
+    src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/whatsapp.png" 
+    alt="Zomato logo" 
+    width="200"
+  />
+</p>
+
+
 # How WhatsApp Works – Product & System Architecture
 
 **Product:** :Whatsapp
