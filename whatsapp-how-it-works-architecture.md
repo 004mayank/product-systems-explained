@@ -8,7 +8,7 @@
 
 
 
-# How WhatsApp Works – Product & System Architecture
+# How WhatsApp Works - Product & System Architecture
 
 **Product:** WhatsApp  
 **Audience:** Product Managers / Developers / Curious Minds  
@@ -78,7 +78,7 @@ Important PM insight:
 
 ---
 
-## 4. Message Flow – Step by Step
+## 4. Message Flow - Step by Step
 
 This is the most important flow to understand as a PM.
 
