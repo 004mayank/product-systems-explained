@@ -6,7 +6,7 @@
   />
 </p>
 
-# How Zomato Works – Ordering System Architecture (PM View)
+# How Zomato Works - Ordering System Architecture (PM View)
 
 **Product:** :Zomato 
 **Audience:** Product Managers/ Developers/Foodies
@@ -56,7 +56,7 @@ Restaurant  <---->  Delivery Partner
 
 ---
 
-## 4. Ordering Flow – Step by Step
+## 4. Ordering Flow - Step by Step
 
 ### Step 1: Discovery & Menu
 - User browses restaurants and menus
