@@ -8,10 +8,12 @@
 
 # How Zomato Works - Ordering System Architecture (PM View)
 
-**Product:** :Zomato 
-**Audience:** Product Managers/ Developers/Foodies
+
+**Product:** Zomato  
+**Audience:** Product Managers / Developers / Foodies  
 **Goal:** Explain how Zomato moves an order from discovery to delivery at scale,
 focusing on product behavior, constraints, and trade-offs.
+
 
 ---
 
@@ -42,17 +44,13 @@ These requirements drive the system design.
 
 ## 3. High-Level Ordering Architecture (Conceptual)
 
-User App
-   |
-   v
-Zomato Platform
-(Pricing, Orders, Payments)
-   |
-   v
-Restaurant  <---->  Delivery Partner
+**Flow:**
+- User App  
+- Zomato Platform *(Pricing, Orders, Payments)*  
+- Restaurant ↔ Delivery Partner  
 
-
-**PM insight:** Zomato is a **coordinator**, not the executor of cooking or delivery.
+**PM Insight:**  
+Zomato acts as a **coordinator**, not the executor of cooking or delivery.
 
 ---
 
