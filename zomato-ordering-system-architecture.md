@@ -60,7 +60,7 @@ Zomato acts as a **coordinator**, not the executor of cooking or delivery.
 - User browses restaurants and menus
 - Prices, ratings, ETA estimates shown
 
-**PM takeaway:** Early expectations are set here—errors ripple downstream.
+**PM takeaway:** Early expectations are set here-errors ripple downstream.
 
 ---
 
@@ -77,7 +77,7 @@ Zomato acts as a **coordinator**, not the executor of cooking or delivery.
 - User confirms order
 - Payment is authorized (not yet settled in all cases)
 
-**PM insight:** This is the *point of no return*—failures here hurt trust most.
+**PM insight:** This is the *point of no return*-failures here hurt trust most.
 
 ---
 
