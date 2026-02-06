@@ -21,7 +21,7 @@ focusing on product behavior, constraints, and trade-offs.
 
 Zomato must reliably convert *intent* into a *delivered meal* across:
 - Millions of users
-- Thousands of restaurants
+- Thousands of restaurants across cities
 - A volatile delivery supply
 - Real-time payments and ETAs
 
