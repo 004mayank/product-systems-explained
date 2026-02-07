@@ -1,24 +1,30 @@
 <p align="center">
   <img 
     src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/whatsapp.png" 
-    alt="Zomato logo" 
+    alt="WhatsApp logo" 
     width="200"
   />
 </p>
 
+# How WhatsApp Works — Product & System Architecture
 
+**Product:** WhatsApp
+**Audience:** Product Managers / Developers / Curious Minds
+**Goal:** Explain how WhatsApp delivers fast, reliable messaging at massive scale (PM-friendly), without going deep into infrastructure jargon.
 
-# How WhatsApp Works - Product & System Architecture
-
-**Product:** WhatsApp  
-**Audience:** Product Managers / Developers / Curious Minds  
-**Goal:** Explain how WhatsApp delivers fast, reliable messaging at massive scale,
-without going deep into infrastructure jargon.
-
+**Related docs:**
+- Teardown: https://github.com/004mayank/product-teardowns/blob/main/whatsapp-messaging-teardown.md
+- PRD: https://github.com/004mayank/product-prd/blob/main/whatsapp-messaging-prd.md
 
 ---
 
-## 1. The Core Product Problem WhatsApp Solves
+## Version history
+- **v2 (current):** added a PM-view system map for the PRD “conversation health” initiatives (TTFR/CCR), including instrumentation, notification decisioning, and rollout/experimentation considerations.
+- **v1:** baseline explanation of WhatsApp messaging architecture, encryption, delivery, and reliability concepts.
+
+---
+
+## 1) The core product problem WhatsApp solves
 
 WhatsApp’s primary job is deceptively simple:
 
@@ -34,7 +40,7 @@ Everything in WhatsApp’s architecture exists to serve these needs.
 
 ---
 
-## 2. Key Product Requirements
+## 2) Key product requirements
 
 WhatsApp optimizes for:
 
@@ -48,41 +54,31 @@ These requirements directly shape the technical design.
 
 ---
 
-## 3. High-Level Architecture (Conceptual)
-
-At a very high level, WhatsApp looks like this:
+## 3) High-level architecture (conceptual)
 
 Important PM insight:
 - WhatsApp servers act as **routers and temporary storage**
 - They are **not permanent message stores**
 - They cannot read message content due to encryption
 
-
-  Sender Device  
-  *(Encrypts Message)*  
-  &nbsp;  
-  │  
-  v  
-
-  +------------------------+  
-  |     WhatsApp Servers   |  
-  |   (Routing & Queue)    |  
-  +------------------------+  
-
-  │  
-  v  
-
-  Recipient Device  
-  *(Decrypts Message)*
-
+```
+Sender Device (encrypts)
+   |
+   v
++--------------------------+
+| WhatsApp Servers         |
+| (routing + queue)        |
++--------------------------+
+   |
+   v
+Recipient Device (decrypts)
+```
 
 ---
 
-## 4. Message Flow - Step by Step
+## 4) Message flow — step by step
 
-This is the most important flow to understand as a PM.
-
-### Step 1: Message Creation
+### Step 1: Message creation
 - User types a message
 - Message is **encrypted on the sender’s device**
 - Encryption keys are generated and stored on devices, not servers
@@ -90,36 +86,28 @@ This is the most important flow to understand as a PM.
 PM takeaway:
 > Privacy is enforced at the product level, not as a backend feature.
 
----
-
-### Step 2: Message Sent to WhatsApp Servers
+### Step 2: Message sent to WhatsApp servers
 - Encrypted message is sent to WhatsApp servers
 - Server identifies the recipient and routes the message
 
 Key point:
 - Servers **cannot decrypt** or inspect message content
 
----
-
-### Step 3: Delivery or Queueing
+### Step 3: Delivery or queueing
 - If recipient is online → message is delivered immediately
 - If recipient is offline → message is temporarily stored
 
 Important constraint:
 - Messages are stored only **until delivery**, not forever
 
----
-
-### Step 4: Delivery Acknowledgement
+### Step 4: Delivery acknowledgement
 - Recipient device confirms receipt
 - WhatsApp servers notify sender (✓✓)
 
 PM takeaway:
 > Read receipts are a product feature built on delivery acknowledgements.
 
----
-
-### Step 5: Message Deletion from Server
+### Step 5: Message deletion from server
 - Once delivered, the message is deleted from WhatsApp servers
 
 This reduces:
@@ -129,7 +117,7 @@ This reduces:
 
 ---
 
-## 5. Offline & Poor Network Handling
+## 5) Offline & poor network handling
 
 WhatsApp is designed for unreliable connectivity.
 
@@ -144,12 +132,11 @@ The system:
 - Maintains message order using timestamps and IDs
 
 PM insight:
-> Reliability is achieved through retries and acknowledgements,
-not through permanent storage.
+> Reliability is achieved through retries and acknowledgements, not through permanent storage.
 
 ---
 
-## 6. End-to-End Encryption (PM Explanation)
+## 6) End-to-end encryption (PM explanation)
 
 End-to-end encryption means:
 - Messages are encrypted on the sender’s device
@@ -165,7 +152,7 @@ This is a **deliberate product choice**, not a technical limitation.
 
 ---
 
-## 7. Group Messaging (Conceptual Difference)
+## 7) Group messaging (conceptual difference)
 
 In group chats:
 - Sender encrypts the message **separately for each participant**
@@ -180,18 +167,18 @@ This is why:
 
 ---
 
-## 8. Failure Scenarios & How WhatsApp Handles Them
+## 8) Failure scenarios & how WhatsApp handles them
 
-### Recipient Offline for Long Time
+### Recipient offline for long time
 - Messages remain queued temporarily
 - If undelivered for too long, messages may expire
 
-### Sender Changes Phone
+### Sender changes phone
 - Encryption keys change
 - Old messages may not sync
 - Backup behavior becomes important
 
-### Server Outage
+### Server outage
 - Messages retry automatically
 - Users may see delayed delivery, not message loss
 
@@ -200,21 +187,20 @@ PM insight:
 
 ---
 
-## 9. Key Trade-offs WhatsApp Makes
+## 9) Key trade-offs WhatsApp makes
 
 | Trade-off | Decision |
-|---------|---------|
-| Privacy vs Server Intelligence | Privacy |
-| Speed vs Rich Server Features | Speed |
-| Simplicity vs Flexibility | Simplicity |
-| Cloud Storage vs Device Ownership | Device ownership |
+|---|---|
+| Privacy vs server intelligence | Privacy |
+| Speed vs rich server features | Speed |
+| Simplicity vs flexibility | Simplicity |
+| Cloud storage vs device ownership | Device ownership |
 
-These trade-offs explain many WhatsApp product decisions,
-including limitations users sometimes complain about.
+These trade-offs explain many WhatsApp product decisions, including limitations users sometimes complain about.
 
 ---
 
-## 10. Why WhatsApp Feels “Instant”
+## 10) Why WhatsApp feels “instant”
 
 From a PM perspective, WhatsApp feels fast because:
 - Message payloads are small
@@ -226,15 +212,91 @@ Speed is a **product principle**, not an accident.
 
 ---
 
-## 11. Takeaways
+## 11) System addendum for the PRD: “Conversation Health” (TTFR/CCR)
 
-- System architecture directly shapes user experience
-- Privacy choices constrain feature design
-- Reliability is built through retries, not guarantees
-- Product simplicity often wins at massive scale
+The PRD proposes three lightweight product changes:
+1) Chat list **“Needs reply”** highlight state
+2) Intent-based **notification prompts**
+3) Group **“Since you were away”** micro-summary based on explicit signals
 
-Understanding these systems helps:
-- Set realistic expectations
-- Make better trade-offs
-- Communicate clearly with engineering teams
+This section maps those to a PM-view architecture.
 
+### 11.1 What needs to be measured (instrumentation)
+To improve **TTFR** and **CCR**, you need consistent definitions and events.
+
+**Metric definitions (from teardown/PRD):**
+- **Conversation start (CS):** first outbound message after ≥X hours inactivity
+- **TTFR:** time from CS to first inbound reply
+- **CCR (24h):** reply received within 24 hours of CS
+
+**Minimum event taxonomy (illustrative):**
+- `messaging.message_sent`
+- `messaging.message_delivered`
+- `messaging.message_read`
+- `conversation.conversation_start`
+- `conversation.reply_received`
+- `ui.chatlist.needs_reply_shown`
+- `ui.chatlist.needs_reply_dismissed`
+- `permissions.notifications_prompt_shown`
+- `permissions.notifications_enabled`
+- `groups.away_summary_shown`
+- `groups.mention_clicked`
+
+PM note:
+> The system should make it easy to compute TTFR/CCR by joining “start” and “reply” events per conversation.
+
+### 11.2 “Needs reply” state — where it can live
+There are two reasonable approaches:
+
+**Option A: On-device computation (preferred for simplicity + privacy)**
+- The client uses local chat state to decide “needs reply.”
+- Pros: privacy-friendly; fast; no server dependency.
+- Cons: cross-device consistency is harder; heuristics may differ.
+
+**Option B: Server-assisted hints (only with minimal metadata)**
+- Server can provide “unreplied incoming” hints based on message headers/acks, not content.
+- Pros: consistent across devices.
+- Cons: more complexity; must be careful with privacy posture.
+
+Given WhatsApp’s product posture, a v1 would typically lean on **Option A**.
+
+### 11.3 Notification decisioning (delivery + relevance)
+TTFR often fails because notifications fail or get ignored.
+
+A PM-view architecture to support notification improvements:
+- **Permission state manager** (client): knows if notifications are allowed, muted, or restricted.
+- **Rate limiting** (client + server): prevents spammy prompting.
+- **Delivery receipt hooks**: leverage delivered/read state to avoid redundant nudges.
+
+The PRD’s “intent-based prompt” is essentially:
+- detect **high-intent moments** (first-send, first-join)
+- show a prompt once
+- measure opt-in + impact on A2/TTFR
+
+### 11.4 “Since you were away” micro-summary (explicit signals only)
+To avoid “feed-ification,” keep summaries anchored to explicit, user-visible signals:
+- mentions of you
+- replies to your messages
+- messages pinned by admins (explicit)
+
+Implementation shape:
+- Client computes an “away session” window (last opened timestamp)
+- On open, it compiles counts and jump links to mentions/replies
+- Cache locally so it’s fast even on poor networks
+
+### 11.5 Experimentation & rollout plumbing
+Shipping conversation-health features safely requires:
+- **Feature flags** (enable/disable quickly)
+- **A/B assignment** (deterministic per user/device)
+- **Guardrail monitoring** (notification disablement, blocks/reports, group mute/leave)
+
+Rollout should be staged:
+1% → 10% → 50% with clear abort conditions.
+
+---
+
+## 12) Takeaways
+- System architecture directly shapes user experience.
+- Privacy choices constrain feature design.
+- Reliability is built through retries and acknowledgements.
+- For “conversation health,” the highest-leverage systems are **instrumentation + notification decisioning + lightweight UI prioritization**.
