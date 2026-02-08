@@ -6,23 +6,25 @@
   />
 </p>
 
-# Slack Messaging — Notification Load Shaping (NYR) System Architecture (V2)
+# Slack Messaging — Notification Load Shaping (NYR) System Architecture (V3)
 
 **Product:** Slack (messaging + notifications)
 **Audience:** Product Managers / Engineers
 **Goal:** Describe a plausible, implementation-oriented system architecture for **notification load shaping** and **Not-Yet-Relevant (NYR)**-style ranking, grounded in **publicly observable Slack behavior** and **generic system design patterns** (no proprietary internals).
 
-**Scope in this doc (V2):**
+**Scope in this doc (V3):**
 - Message → notification candidate generation
 - NYR labeling/scoring → ranking → delivery (cross-device)
 - User feedback loops (Not relevant / Snooze / Mute) → preference updates
 - Digest / catch-up generation
 - Reliability, privacy/safety, and observability for the above
-- **NEW in V2:** concrete **API contracts + event schemas** for candidate generation, NYR scoring, delivery, preferences, and feedback
+- API contracts + event schemas for candidate generation, NYR scoring, delivery, preferences, and feedback
+- **NEW in V3:** scalability sizing assumptions, queue/partitioning design, hotspot mitigation, cache strategy, and degraded-mode/load-shedding policies
 
 **Version history**
 - **V1:** Conceptual decomposition + flows + reliability/privacy/observability
-- **V2 (current):** Adds API/event contract layer, non-functional requirements, and explicit trade-offs/decisions
+- **V2:** Adds API/event contract layer, non-functional requirements, and explicit trade-offs/decisions
+- **V3 (current):** Adds sizing + partitioning/ordering semantics, hotspot mitigation, cache strategy, and operational degraded modes
 
 ---
 
@@ -64,6 +66,32 @@ These NFRs make the design constraints explicit. Values are indicative targets f
 - Enforce per-workspace quotas and isolation:
   - noisy workspace cannot starve global queues
   - admin policies must be applied consistently
+
+### (V3) Back-of-envelope sizing (assumptions → derived QPS)
+These numbers are **illustrative** and intentionally rounded. The goal is to size the pipeline, pick partitioning strategies, and define degraded-mode triggers.
+
+#### Example assumptions
+- **Workspaces (tenants):** 1,000,000 total; 200,000 WAU (weekly active)
+- **WAU users:** 30,000,000 (across all active workspaces)
+- **Messages/day:** 2,000,000,000 (2B)
+- **Peak-to-average ratio (diurnal + incident spikes):** 8×
+- **% messages producing any candidate notification:** 20% (DMs, mentions, followed threads, “all messages” channels)
+- **Avg candidates per eligible message:** 2.5 (many are 1:1 DM; some are channel mentions/thread participants)
+- **Avg delivery targets per candidate:** 1.2 (in-app to active clients + push sometimes)
+- **Avg push notifications per delivered candidate:** 0.6 (presence-aware suppression + bundling)
+
+#### Derived volumes (rough)
+- **Message ingest QPS (avg):** 2B / 86,400 ≈ **23k msg/s**
+- **Message ingest QPS (peak):** 23k × 8 ≈ **185k msg/s**
+- **Candidate generation QPS (avg):** 23k × 20% × 2.5 ≈ **11.5k candidates/s**
+- **Candidate generation QPS (peak):** 185k × 20% × 2.5 ≈ **92k candidates/s**
+- **Scoring QPS (peak):** same order as candidates; typically **~100k/s** (batch scoring per user can reduce RPC overhead)
+- **Delivery attempt QPS (peak):** candidates × delivery_targets ≈ **110k attempts/s**
+- **Push provider QPS (peak, post-bundling):** attempts × push fraction ≈ **~60k push sends/s**
+
+#### Implications
+- The system must be designed for **burst absorption** (queues + budgets) and **multi-tenant fairness**.
+- Hotspots are dominated by **fan-out amplification** (big channels, @here/@channel, incident rooms) rather than baseline chat volume.
 
 ---
 
@@ -259,7 +287,7 @@ IDs shown are conceptual; Slack publicly uses workspace/channel identifiers and 
 
 ---
 
-## 6) API contracts + event schemas (V2)
+## 6) API contracts + event schemas (V3)
 
 This section turns the conceptual architecture into a **contract-first** design so teams can build services independently. The interfaces are intentionally generic (HTTP/JSON shown; gRPC equivalents are straightforward).
 
@@ -271,6 +299,32 @@ This section turns the conceptual architecture into a **contract-first** design 
 ---
 
 ### 6.1 Core topics (stream bus)
+
+#### (V3) Queue/topic design conventions (partitioning, ordering, replay)
+Assume the stream bus is a **durable log** (Kafka/Pulsar/Kinesis-like) plus supporting queues (SQS/Rabbit-like) for specialized workloads.
+
+**Partition keys (recommended)**
+- `messaging.message_created.v1`: partition by **`workspace_id`** (baseline fairness), optionally sub-partition by `channel_id` for very large workspaces.
+- Per-recipient downstream topics (candidates/decisions/delivery): partition by **`workspace_id:user_id`** to preserve per-user ordering and simplify budgeting.
+
+**Ordering semantics (what we guarantee)**
+- **Hard guarantee:** preserve ordering **within a partition**.
+- **Product-aligned guarantee:** best-effort ordering for **a user’s notifications** (partition on `workspace_id:user_id`).
+- **Not guaranteed:** global ordering across workspaces/channels.
+
+**Idempotency + dedupe keys**
+- Events: `event_id` is globally unique.
+- Candidate creation dedupe key: `dedupe_key = workspace_id + ":" + user_id + ":" + event_id + ":" + candidate_type`.
+- Delivery attempt dedupe key: `dedupe_key = notification_id + ":" + device_id + ":" + channel`.
+- Storage writes must be **idempotent upserts** keyed by these dedupe keys.
+
+**Replay strategy**
+- Keep a **hot retention** window (e.g., 24–72h) on core topics for quick reprocessing.
+- Persist a **cold archive** (object store) for longer replay/debug (e.g., 14–30d) depending on privacy/retention.
+- Consumers must be able to:
+  - rewind offsets for incident recovery
+  - re-emit derived events with a new `schema_version` or `reprocess_job_id`
+- Because processing is at-least-once, replay correctness relies on **idempotent state transitions** and **monotonic writes**.
 
 #### `messaging.message_created.v1`
 Emitted when a message is committed.
@@ -324,6 +378,22 @@ Emitted by clients when a user interacts with a notification.
   }
 }
 ```
+
+#### (V3) Suggested derived topics
+These topics keep services loosely coupled and enable replay/backfill.
+
+- `notifications.candidate_created.v1`
+  - Produced by orchestrator
+  - **Partition key:** `workspace_id:user_id` (per-user ordering + budgeting)
+  - **Payload:** candidate metadata + `dedupe_key`
+- `notifications.decision_made.v1`
+  - Produced by NYR scorer/policy engine
+  - **Partition key:** `workspace_id:user_id`
+  - **Payload:** decision + reasons + `review_after_ms` for NYR
+- `notifications.delivery_attempted.v1`
+  - Produced by delivery service
+  - **Partition key:** `workspace_id:user_id` (or `notification_id`)
+  - **Payload:** attempt state transitions + provider error codes
 
 ---
 
@@ -568,6 +638,39 @@ State enum:
   - clients fetch authoritative counts on app open
   - push notifications carry only hints (“new activity”) not authoritative counts
 
+### (V3) Cache strategy (what, where, TTLs) + consistency impact
+Caching is essential because candidate generation and scoring touch high-cardinality state (membership, prefs, presence).
+
+#### What to cache
+- **Workspace + channel membership indexes**
+  - Key: `(workspace_id, channel_id)` → member shards / bloom / compressed bitsets
+  - TTL: minutes; invalidate on join/leave events
+- **Thread subscription/participant index**
+  - Key: `thread_id` → subscribers
+  - TTL: minutes; invalidate on follow/unfollow
+- **User preference snapshots** (mute/snooze/DND/channel overrides)
+  - Key: `(workspace_id, user_id)` → prefs + `etag`
+  - TTL: 10–60s hot cache; hard invalidation on pref-change events
+- **Presence / active-client hints**
+  - Key: `(workspace_id, user_id)` → active clients, last_seen
+  - TTL: 5–15s (very short)
+- **Notification bundle state**
+  - Key: `bundle_key` → current bundle counters + last_sent
+  - TTL: bundling window + a safety margin (e.g., 10m)
+
+#### Where to cache
+- **In-process LRU** for per-host hot keys (lowest latency, small memory)
+- **Distributed cache** (Redis/Memcached-like) for shared reads and rate-limit buckets
+- **Edge/client caches** for read-only UX hints (badge count hints, last digest cursor)
+
+#### Consistency impact (what can go wrong)
+- Membership/prefs caches can be **stale** → risk false positives (notify someone who muted) or false negatives (miss a newly joined user).
+- Mitigations:
+  - Prefer **fail-closed** for suppressions that users expect (if unsure about mute/DND, err on suppress or in-app only)
+  - Use **ETags** and conditional reads for prefs snapshots
+  - Propagate invalidations via events (pref_changed, membership_changed)
+  - Keep short TTLs on correctness-sensitive caches (prefs/presence)
+
 ---
 
 ## 8) Failure handling + reliability
@@ -589,13 +692,60 @@ State enum:
   - push gateway retries with provider-aware limits
 - Dead-letter queues for poison events (schema issues, bad payloads)
 
-### Rate limiting & load shedding
-- Per-user and per-workspace budgets:
-  - max notifications/minute
-  - max concurrent deliveries
-- Degradation modes:
-  - switch from per-message pushes to digest/bundles
-  - disable low-importance candidate types temporarily
+### (V3) Hotspot mitigation, rate limiting & load shedding
+Hotspots typically come from **fan-out amplification** rather than baseline traffic:
+- **Big channels** with thousands of members
+- **Incident / war-room channels** with extremely high message rate
+- **Spam storms** (bots/integrations gone wild; mention abuse)
+
+#### Mitigation patterns (before “degraded mode”)
+- **Presence-aware suppression:** if the user is active in the channel/thread, prefer in-app updates; avoid push.
+- **Per-channel bundling keys:** collapse bursts into “N new messages in #channel” with a short **bundling window** (e.g., 15–60s).
+- **Mention throttles:** strict limits for `@here/@channel` and app/bot mentions; require workspace policy + quotas.
+- **Fan-out control:** for extremely large channels, generate a lightweight “channel activity” candidate and let the **client pull** details (reduces per-message recipient expansion).
+- **Spam classification gate:** if sender/app is suspected spam, route to a quarantine path and require stricter thresholds.
+
+#### Priority tiers (decide what to protect)
+Define a small set of tiers that map to user expectations:
+- **P0:** direct messages, direct @mentions, security/admin critical
+- **P1:** thread replies you follow, small group DMs
+- **P2:** channel activity (non-mentions), reactions, low-signal events
+- **P3:** “FYI” / bulk events that can be digest-only
+
+#### Budgets (fairness across tenants + users)
+Budgets are enforced at multiple layers:
+- **Per-user budgets:** max pushes/minute, max bundles/minute, max total notifications/day (soft)
+- **Per-workspace budgets:** cap total push sends/s and candidate generation/s per workspace
+- **Global budgets:** cap calls to external providers (APNs/FCM), cap ranking RPCs/s
+
+Implementation sketch:
+- Token buckets keyed by `workspace_id` and `workspace_id:user_id`
+- Admission control checks **before** expensive scoring and before push dispatch
+
+#### Degraded modes (explicit product behavior)
+When queues back up, providers throttle, or downstream dependencies fail, switch modes by tier:
+1. **Widen bundling windows** (e.g., 60s → 5m) for P2/P3
+2. **Drop low-priority pushes:**
+   - suppress P2/P3 **non-mentions** first
+   - keep in-app/websocket updates best-effort
+3. **Digest-only fallback:** route P2/P3 into digest/catch-up; deliver at scheduled windows
+4. **Sampling:** for extremely hot channels, sample channel-activity events for non-engaged users
+5. **Graceful ranking fallback:** if ML scorer is down, use rules + static thresholds
+
+**Never degrade** (as much as possible): P0 events. If push providers are down, fall back to:
+- in-app banner/badge (active clients)
+- email/SMS only if explicitly configured and policy-approved
+
+#### Operational triggers (examples)
+- Consumer lag > X seconds on candidate/decision topics
+- Push provider error rate > Y% or sustained throttling
+- Ranking service latency p95 > threshold
+- Workspace-level anomaly detector flags unusual mention rates
+
+All degraded-mode transitions should be:
+- controlled by **feature flags**
+- recorded in an **audit log** (who/what/when)
+- visible in dashboards (so PMs understand behavior changes)
 
 ### Ordering
 - Notification ordering should be **best-effort** and relevance-based, not strict FIFO.
@@ -670,9 +820,9 @@ State enum:
 
 ---
 
-## 11) Trade-offs & decisions (V2)
+## 11) Trade-offs & decisions (V3)
 
-### Decisions we commit to in V1/V2
+### Decisions we commit to in V1/V2/V3
 - **Event-driven fan-out** with a durable stream/log as the integration boundary.
 - **At-least-once processing** everywhere, paired with **idempotency keys** and monotonic state transitions.
 - **Metadata-first notifications:** delivery payloads contain IDs + small render hints; clients fetch content with user auth.
