@@ -6,18 +6,23 @@
   />
 </p>
 
-# Slack Messaging — Notification Load Shaping (NYR) System Architecture (V1)
+# Slack Messaging — Notification Load Shaping (NYR) System Architecture (V2)
 
 **Product:** Slack (messaging + notifications)
 **Audience:** Product Managers / Engineers
 **Goal:** Describe a plausible, implementation-oriented system architecture for **notification load shaping** and **Not-Yet-Relevant (NYR)**-style ranking, grounded in **publicly observable Slack behavior** and **generic system design patterns** (no proprietary internals).
 
-**Scope in this doc (V1):**
+**Scope in this doc (V2):**
 - Message → notification candidate generation
 - NYR labeling/scoring → ranking → delivery (cross-device)
 - User feedback loops (Not relevant / Snooze / Mute) → preference updates
 - Digest / catch-up generation
 - Reliability, privacy/safety, and observability for the above
+- **NEW in V2:** concrete **API contracts + event schemas** for candidate generation, NYR scoring, delivery, preferences, and feedback
+
+**Version history**
+- **V1:** Conceptual decomposition + flows + reliability/privacy/observability
+- **V2 (current):** Adds API/event contract layer, non-functional requirements, and explicit trade-offs/decisions
 
 ---
 
@@ -34,7 +39,35 @@ NYR in this context means:
 
 ---
 
-## 2) High-level architecture (conceptual)
+## 2) Non-functional requirements (NFRs)
+
+These NFRs make the design constraints explicit. Values are indicative targets for a large SaaS messaging product.
+
+### Latency SLOs (end-to-end)
+- **Mention/DM push eligibility decision:** p50 < **150 ms**, p95 < **500 ms** from `MessageCreated` event ingestion
+- **Push dispatch (to APNs/FCM):** p95 < **2 s** from message commit for eligible high-urgency events
+- **In-app (websocket) fanout:** p95 < **300 ms** to active clients (subject to network)
+- **Preference change propagation (mute/snooze/DND):** p95 < **5 s** cross-device effect
+- **Digest generation:** within **5–15 min** of scheduled window; freshness > strict ordering
+
+### Availability / durability
+- **Notification pipeline availability:** **99.95%** monthly (degraded mode allowed)
+- **No data loss** for notification state transitions (candidate/delivered/opened) beyond configured retention windows
+- **At-least-once** event processing with idempotent writes; bounded duplication
+
+### Cost constraints (practical)
+- Favor **metadata-only** ranking and minimal push payloads (reduces storage + egress)
+- Push provider calls are expensive at scale → aggressive **bundling** and **rate budgets**
+- Feature computation should be **cacheable** and/or **pre-aggregated**; avoid per-candidate heavy joins
+
+### Multi-tenancy constraints
+- Enforce per-workspace quotas and isolation:
+  - noisy workspace cannot starve global queues
+  - admin policies must be applied consistently
+
+---
+
+## 3) High-level architecture (conceptual)
 
 This is a **conceptual decomposition** consistent with typical SaaS messaging systems.
 
@@ -92,7 +125,7 @@ This is a **conceptual decomposition** consistent with typical SaaS messaging sy
 
 ---
 
-## 3) Event flows
+## 4) Event flows
 
 ### Flow 1 — Message create → notification candidate generation
 
@@ -177,7 +210,7 @@ A digest is a **batched summary** that trades immediacy for lower interruption c
 
 ---
 
-## 4) Data model (key entities + IDs)
+## 5) Data model (key entities + IDs)
 
 IDs shown are conceptual; Slack publicly uses workspace/channel identifiers and message timestamps in some contexts, but the architecture should not depend on a specific internal format.
 
@@ -226,7 +259,294 @@ IDs shown are conceptual; Slack publicly uses workspace/channel identifiers and 
 
 ---
 
-## 5) Consistency + cross-device considerations
+## 6) API contracts + event schemas (V2)
+
+This section turns the conceptual architecture into a **contract-first** design so teams can build services independently. The interfaces are intentionally generic (HTTP/JSON shown; gRPC equivalents are straightforward).
+
+### Design principles
+- **Events are the source of truth** for fan-out; services are **stateless where possible**.
+- Use **at-least-once delivery** + **idempotent writes** (dedupe keys are part of the contract).
+- Prefer **metadata and IDs** over message bodies; fetch full content via authenticated read APIs.
+
+---
+
+### 6.1 Core topics (stream bus)
+
+#### `messaging.message_created.v1`
+Emitted when a message is committed.
+
+```json
+{
+  "schema_version": 1,
+  "event_id": "evt_01J...",
+  "event_type": "message_created",
+  "occurred_at_ms": 1739000000000,
+  "workspace_id": "w_123",
+  "channel_id": "c_456",
+  "message_id": "m_789",
+  "thread_id": "t_001",
+  "sender_user_id": "u_222",
+  "message_kind": "channel|dm|group_dm",
+  "flags": {
+    "has_mentions": true,
+    "is_thread_reply": true,
+    "is_bot": false,
+    "has_files": false
+  },
+  "mention_user_ids": ["u_111"],
+  "mention_scope": "user|here|channel|null"
+}
+```
+
+#### `notifications.feedback_event.v1`
+Emitted by clients when a user interacts with a notification.
+
+```json
+{
+  "schema_version": 1,
+  "event_id": "evt_01J...",
+  "event_type": "notification_feedback",
+  "occurred_at_ms": 1739000005000,
+  "workspace_id": "w_123",
+  "user_id": "u_111",
+  "notification_id": "n_abc",
+  "action": "opened|dismissed|muted_channel|snoozed|marked_read|not_relevant",
+  "client": {
+    "platform": "ios|android|web|desktop",
+    "app_version": "1.2.3",
+    "device_id": "d_777",
+    "timezone": "Asia/Kolkata"
+  },
+  "context": {
+    "channel_id": "c_456",
+    "thread_id": "t_001",
+    "message_id": "m_789"
+  }
+}
+```
+
+---
+
+### 6.2 Notification Orchestrator (candidate generation)
+
+**Purpose:** convert messaging events into per-user notification candidates.
+
+#### API: `POST /v1/notification-candidates:generate`
+Usually invoked by a stream consumer (not a public API).
+
+**Request**
+```json
+{
+  "request_id": "req_01J...",
+  "source_event": {
+    "event_type": "message_created",
+    "event_id": "evt_01J...",
+    "workspace_id": "w_123",
+    "channel_id": "c_456",
+    "message_id": "m_789",
+    "thread_id": "t_001",
+    "sender_user_id": "u_222",
+    "mention_user_ids": ["u_111"],
+    "mention_scope": "user"
+  },
+  "idempotency_key": "w_123:evt_01J...:candidate-gen"
+}
+```
+
+**Response**
+```json
+{
+  "request_id": "req_01J...",
+  "candidates": [
+    {
+      "candidate_id": "cand_01J...",
+      "workspace_id": "w_123",
+      "user_id": "u_111",
+      "message_id": "m_789",
+      "thread_id": "t_001",
+      "candidate_type": "mention|dm|thread_reply|channel_activity|digest",
+      "features_hint": {
+        "has_direct_mention": true,
+        "is_thread_participant": true,
+        "channel_is_muted": false
+      }
+    }
+  ]
+}
+```
+
+**Notes**
+- Candidate generation can be implemented as a pure function over (event + membership + prefs snapshot).
+- Any expensive joins should be pushed into **indexes** (membership, thread subscriptions) or caches.
+
+---
+
+### 6.3 NYR scoring / ranking service
+
+#### API: `POST /v1/nyr:score`
+Scores candidates and returns decisions + policy explanations.
+
+**Request**
+```json
+{
+  "request_id": "req_01J...",
+  "workspace_id": "w_123",
+  "user_id": "u_111",
+  "candidates": [
+    {
+      "candidate_id": "cand_01J...",
+      "message_id": "m_789",
+      "thread_id": "t_001",
+      "candidate_type": "mention",
+      "event_id": "evt_01J..."
+    }
+  ],
+  "context": {
+    "now_ms": 1739000006000,
+    "device_state": {
+      "active_clients": ["desktop"],
+      "push_enabled": true
+    },
+    "prefs_snapshot_etag": "prefs_etag_9f..."
+  },
+  "idempotency_key": "w_123:u_111:evt_01J...:score"
+}
+```
+
+**Response**
+```json
+{
+  "request_id": "req_01J...",
+  "decisions": [
+    {
+      "candidate_id": "cand_01J...",
+      "eligible": true,
+      "decision": "deliver_now|defer_nyr|suppress|bundle",
+      "nyr": {
+        "label": "not_yet_relevant|relevant_now|never_relevant",
+        "review_after_ms": 1739000306000
+      },
+      "score": {
+        "relevance": 0.92,
+        "urgency": "high|medium|low",
+        "model_version": "nyr_ranker_2026_02_01"
+      },
+      "policy_reasons": [
+        "direct_mention",
+        "within_rate_budget",
+        "user_not_in_dnd"
+      ]
+    }
+  ]
+}
+```
+
+**Decision semantics**
+- `deliver_now`: route to delivery service immediately
+- `defer_nyr`: store as NYR for later surfacing (catch-up, digest, in-app inbox)
+- `suppress`: do not surface (e.g., muted channel, blocked sender)
+- `bundle`: eligible but will be collapsed into an existing bundle key
+
+---
+
+### 6.4 Delivery service
+
+#### API: `POST /v1/notifications:deliver`
+Creates delivery attempts for targets and dispatches.
+
+**Request**
+```json
+{
+  "request_id": "req_01J...",
+  "notification": {
+    "notification_id": "n_abc",
+    "workspace_id": "w_123",
+    "user_id": "u_111",
+    "source_event_id": "evt_01J...",
+    "candidate_id": "cand_01J...",
+    "message_ref": {"channel_id": "c_456", "message_id": "m_789", "thread_id": "t_001"},
+    "type": "mention",
+    "render_hint": {"title": "Mention", "body_preview": "@you …"}
+  },
+  "targets": [
+    {"channel": "in_app", "client_types": ["desktop", "web"]},
+    {"channel": "push", "provider": "apns|fcm", "device_id": "d_777"}
+  ],
+  "idempotency_key": "n_abc:deliver"
+}
+```
+
+**Response**
+```json
+{
+  "request_id": "req_01J...",
+  "delivery_attempts": [
+    {
+      "attempt_id": "att_01J...",
+      "notification_id": "n_abc",
+      "target": {"channel": "push", "device_id": "d_777"},
+      "state": "queued|sent|failed",
+      "provider_message_id": "apns_..."
+    }
+  ]
+}
+```
+
+**Bundling contract**
+- Delivery may accept a `bundle_key` (e.g., `w_123:u_111:c_456`) to collapse multiple events.
+
+---
+
+### 6.5 Preferences service (settings, mutes, DND)
+
+#### API: `GET /v1/preferences/{workspace_id}/{user_id}`
+Returns a normalized view used by orchestrator and scorer.
+
+```json
+{
+  "workspace_id": "w_123",
+  "user_id": "u_111",
+  "etag": "prefs_etag_9f...",
+  "dnd": {"enabled": true, "until_ms": 1739003600000},
+  "channel_overrides": {
+    "c_456": {"muted": false, "notify": "mentions_only|all|none"}
+  },
+  "digest": {"enabled": true, "cadence": "daily|weekly", "hour_local": 9}
+}
+```
+
+#### API: `POST /v1/preferences:apply`
+Applies user actions (mute/snooze) with audit-friendly semantics.
+
+```json
+{
+  "request_id": "req_01J...",
+  "workspace_id": "w_123",
+  "user_id": "u_111",
+  "change": {
+    "type": "mute_channel|snooze|set_dnd|set_channel_level",
+    "channel_id": "c_456",
+    "until_ms": 1739010000000
+  },
+  "idempotency_key": "w_123:u_111:mute:c_456:1739010000000"
+}
+```
+
+---
+
+### 6.6 State store contracts (notification state machine)
+
+To support retries + cross-device convergence, treat state updates as **monotonic**.
+
+Example conditional transition (conceptual):
+- `PUT /v1/notification-state/{notification_id}` with `if_state=delivered` → `opened`
+
+State enum:
+- `candidate` → `suppressed|deferred_nyr|bundled|delivered` → `opened|dismissed`
+
+---
+
+## 7) Consistency + cross-device considerations
 
 ### What must be consistent
 - **Read state / badge counts**: should converge across mobile/desktop/web.
@@ -250,7 +570,7 @@ IDs shown are conceptual; Slack publicly uses workspace/channel identifiers and 
 
 ---
 
-## 6) Failure handling + reliability
+## 8) Failure handling + reliability
 
 ### Idempotency
 - Treat notification creation as idempotent by keying on:
@@ -283,7 +603,7 @@ IDs shown are conceptual; Slack publicly uses workspace/channel identifiers and 
 
 ---
 
-## 7) Privacy & safety considerations
+## 9) Privacy & safety considerations
 
 ### Least privilege
 - Notification services should access:
@@ -312,7 +632,7 @@ IDs shown are conceptual; Slack publicly uses workspace/channel identifiers and 
 
 ---
 
-## 8) Observability (logs/metrics/traces) + guardrails
+## 10) Observability (logs/metrics/traces) + guardrails
 
 ### What to instrument
 - **Counters**
@@ -350,12 +670,27 @@ IDs shown are conceptual; Slack publicly uses workspace/channel identifiers and 
 
 ---
 
-## 9) Key trade-offs (explicit)
+## 11) Trade-offs & decisions (V2)
 
-- **Immediate vs relevant:** NYR enables deferring non-urgent interruptions.
-- **Server intelligence vs privacy:** keep payload minimal; favor metadata and aggregates.
-- **Consistency vs availability:** accept eventual convergence for counts/digests.
-- **Personalization vs simplicity:** start rule-based + thresholds; add models behind flags.
+### Decisions we commit to in V1/V2
+- **Event-driven fan-out** with a durable stream/log as the integration boundary.
+- **At-least-once processing** everywhere, paired with **idempotency keys** and monotonic state transitions.
+- **Metadata-first notifications:** delivery payloads contain IDs + small render hints; clients fetch content with user auth.
+- **Policy before ML:** hard constraints (mutes, DND, admin policy, budgets) gate any model-based scoring.
+- **Degraded modes are product features:** bundling/digests are first-class fallbacks during spikes/outages.
+
+### Trade-offs (why these choices)
+- **Immediate vs relevant:** NYR defers non-urgent interruptions to protect long-term engagement.
+- **Consistency vs availability:** accept eventual convergence for badge counts and digests to keep the pipeline highly available.
+- **Server intelligence vs privacy:** keep raw content out of the pipeline; use aggregates and coarse features.
+- **Complexity vs iteration speed:** contract-first APIs add upfront work, but enable parallel development and safer rollouts.
+
+### What we intentionally *don’t* do (yet)
+- **No “exactly-once” end-to-end guarantees.** We prefer simpler at-least-once + dedupe because push providers and clients are inherently unreliable.
+- **No per-recipient heavy online feature joins** (e.g., large multi-table queries) on the critical path. Those belong in precomputed indexes/feature stores.
+- **No fully personalized text generation in notifications** (beyond previews). Summarization can be added later, but raises cost and privacy concerns.
+- **No strict global ordering of notifications.** Users care about relevance and thread/DM coherence, not total FIFO across the workspace.
+- **No cross-workspace learning by default.** Any model sharing should be opt-in and privacy-reviewed.
 
 ---
 
