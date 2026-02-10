@@ -6,13 +6,13 @@
   />
 </p>
 
-# Slack Messaging — Notification Load Shaping (NYR) System Architecture (V3)
+# Slack Messaging - Notification Load Shaping (NYR) System Architecture
 
 **Product:** Slack (messaging + notifications)
 **Audience:** Product Managers / Engineers
 **Goal:** Describe a plausible, implementation-oriented system architecture for **notification load shaping** and **Not-Yet-Relevant (NYR)**-style ranking, grounded in **publicly observable Slack behavior** and **generic system design patterns** (no proprietary internals).
 
-**Scope in this doc (V3):**
+**Scope in this doc :**
 - Message → notification candidate generation
 - NYR labeling/scoring → ranking → delivery (cross-device)
 - User feedback loops (Not relevant / Snooze / Mute) → preference updates
@@ -155,7 +155,7 @@ This is a **conceptual decomposition** consistent with typical SaaS messaging sy
 
 ## 4) Event flows
 
-### Flow 1 — Message create → notification candidate generation
+### Flow 1 - Message create → notification candidate generation
 
 **Trigger:** a message is created (channel, DM, thread reply).
 
@@ -175,7 +175,7 @@ This is a **conceptual decomposition** consistent with typical SaaS messaging sy
 
 ---
 
-### Flow 2 — NYR labeling/scoring → ranking → delivery on devices
+### Flow 2 - NYR labeling/scoring → ranking → delivery on devices
 
 1. **Orchestrator → Ranking service:** send candidate(s) for scoring.
 2. **Ranking service** computes:
@@ -201,7 +201,7 @@ This is a **conceptual decomposition** consistent with typical SaaS messaging sy
 
 ---
 
-### Flow 3 — User feedback (not relevant/snooze) → preference updates → model/heuristic adjustments
+### Flow 3 - User feedback (not relevant/snooze) → preference updates → model/heuristic adjustments
 
 **Feedback sources (observable in many products):**
 - “Mute channel,” “Snooze notifications,” “Mark as read,” “Not relevant” (or implicit signals: dismissal without open)
@@ -221,7 +221,7 @@ This is a **conceptual decomposition** consistent with typical SaaS messaging sy
 
 ---
 
-### Flow 4 — Digest / catch-up generation
+### Flow 4 - Digest / catch-up generation
 
 A digest is a **batched summary** that trades immediacy for lower interruption cost.
 
