@@ -1,10 +1,10 @@
 # Instagram DMs — Conversation Health Assist (Needs Reply / Requests Triage / Open Loops)
 
-**Artifact:** System Architecture (V1)  
-**Product:** Instagram (DMs)  
-**Scope:** Architecture to support the PRD features shipped in PRD v3 (lightweight, policy-safe, no “deep semantic” intent)  
-**Author:** Mayank Malviya (with Botty)  
-**Status:** v1 — end-to-end design + key components + trade-offs  
+**Artifact:** System Architecture (V2)
+**Product:** Instagram (DMs)
+**Scope:** Architecture to support the PRD features shipped in PRD v3 (lightweight, policy-safe; avoid “deep semantic” intent)
+**Author:** Mayank Malviya (with Botty)
+**Status:** v2 — hardened contracts, caching/consistency, safety guardrails, and failure handling
 
 ---
 
@@ -14,255 +14,314 @@ We’re adding three lightweight “conversation health” assists to Instagram 
 2) a **Requests triage** UX in Message Requests (signals + one-tap actions + likely-spam bucket), and
 3) an **Open Loops** entry module that resurfaces eligible items when the user returns after time away.
 
-The architecture must be **safe** (avoid spam amplification), **low-latency**, **consistent across devices**, and **measurable** (experiments + event logging).
+The architecture must be **safe** (avoid spam amplification, protect sensitive users), **low-latency** (inbox first paint unaffected), **consistent across devices** (handled state + caps), and **measurable** (experiments + guardrails).
 
 ---
 
 ## 1) Design principles / constraints
-- **No new “deep ML” claims**: start with explicit context + simple heuristics; optionally evolve to model-driven later.
-- **Do not reorder the inbox** in V1. Add indicators/modules only.
-- **Consistency across devices**: if a user marks “handled” on one device, it should generally reflect on others.
-- **Privacy/data minimization**: store only state needed for the feature (e.g., handled flag + timestamps). Avoid storing derived sensitive intent.
-- **Latency**: DM list must remain fast. Compute or fetch labels without blocking first paint.
-- **Safety**: integrate existing spam/restriction signals; conservative eligibility.
+- **Policy-safe by construction**: prefer explicit metadata + trust/safety signals; avoid storing/transporting message content.
+- **No inbox reordering (V1–V2)**: add indicators/modules only; do not change thread ordering.
+- **Consistency across devices**: “handled” and module frequency caps are user-scoped and should converge quickly.
+- **Data minimization**: store only user actions + minimal timestamps; derived signals should be ephemeral.
+- **Latency isolation**: assist computation must not block inbox response; timeouts degrade to “no assist”.
+- **Safety first**: conservative eligibility; integrate existing spam/restriction/teen protections.
 
 ---
 
 ## 2) High-level architecture
 
-### Components (logical)
+### 2.1 Components (logical)
 1) **Messaging Backend** (existing)
-   - Thread list/inbox service
-   - Message store
+   - Inbox/thread list service
+   - Message store / thread metadata
    - Requests inbox
-   - Trust/safety classifiers (existing spam signals)
+   - Existing trust & safety pipelines (spam buckets, restriction states, integrity signals)
 
-2) **Conversation Health Service (new or logical layer)**
-   - Computes **Needs Reply eligibility + score** per thread
+2) **Conversation Health Service (CHS)** (new logical service or internal module)
+   - Computes **Needs Reply eligibility** + lightweight reasons
    - Produces **Open Loops** module payload
-   - Stores per-user/per-thread “handled” state
-   - Enforces caps/frequency rules
+   - Stores **user-per-thread handled state**
+   - Enforces **caps/frequency**
+   - Emits structured debug info (sampled) for audits
 
-3) **Feature Flag / Experimentation Platform** (existing)
-   - Gates features (`dm_needs_reply_enabled`, `dm_open_loops_enabled`, etc.)
-   - Assigns variants (control vs treatment)
+3) **Experimentation / Feature Flag platform** (existing)
+   - gates: `dm_needs_reply_enabled`, `dm_open_loops_enabled`, `dm_requests_triage_enabled`
+   - variants & holdouts for guardrails
 
-4) **Client Apps (iOS/Android)**
-   - Renders DM list indicator
-   - Renders Requests triage surfaces
-   - Renders Open Loops module
-   - Sends interaction events
+4) **Clients (iOS/Android)**
+   - renders pill/module and requests triage UX
+   - optimistic UI for user actions
+   - emits analytics events
 
-5) **Analytics/Event Pipeline** (existing)
-   - Receives events and enables dashboards/guardrails
+5) **Analytics/Event pipeline** (existing)
+   - event ingestion, dashboards, experiment analysis, safety monitoring
+
+### 2.2 Primary integration choice
+**Server-augmented thread list (recommended)**
+- Inbox service calls CHS using thread summaries and returns assist fields in the inbox response.
+- CHS computations are on **summaries only**; avoid message-body fetch.
 
 ---
 
-## 3) Data model (minimal)
+## 3) Data model (minimal & durable)
 
-### 3.1 Per-thread computed attributes (derived)
-These are computed on request and generally **not stored long-term**:
-- `eligible_for_needs_reply` (bool)
-- `needs_reply_score` (int)
-- `needs_reply_reason` (enum): `story_reply | question | verified | graph | other`
+### 3.1 Ephemeral computed attributes (derived; not stored long-term)
+Computed per request (or cached for minutes):
+- `needs_reply.eligible` (bool)
+- `needs_reply.score_bucket` (enum): `low|med|high` (avoid exposing raw score)
+- `needs_reply.reason` (enum): `story_reply | question_hint | verified_sender | strong_graph | other`
 
-Inputs (read-only):
-- `last_inbound_ts`
-- `last_outbound_ts`
-- `is_story_reply_context`
-- `is_request_thread`
-- `is_muted | is_archived | is_restricted | is_blocked`
-- `trust_signals`: verified, mutuals, etc.
-- `spam_classification_bucket` (existing)
+Inputs (read-only thread summary fields):
+- `last_inbound_ts`, `last_outbound_ts`
+- `thread_folder`: `primary|general|requests`
+- `is_story_reply_context` (bool)
+- `relationship_flags`: `is_mutual`, `is_verified_sender` (or sender verified)
+- `safety_state`: `is_muted`, `is_archived`, `is_restricted`, `is_blocked`, `is_teen_protected` (or equivalent)
+- `spam_bucket` (existing): `hc_spam|suspected|clean` (illustrative)
+- `question_hint` (bool) — computed without sharing text (see §6)
 
 ### 3.2 Stored state (new)
-**UserThreadAssistState** (per user_id, thread_id):
-- `handled_until_ts` (nullable) — set when user taps “Mark handled”
-- `handled_reason` (optional enum) — e.g., `user_marked_handled`
+**UserThreadAssistState** (key: `user_id + thread_id`)
+- `handled_until_ts` (nullable)
+- `handled_source` (enum): `user_marked_handled | auto_expired` (optional)
 - `updated_at`
 
-**UserAssistSessionState** (per user_id, day):
+**UserAssistSurfaceState** (key: `user_id + surface`)
 - `open_loops_last_shown_ts`
 - `open_loops_last_dismiss_ts`
+- `open_loops_last_payload_hash` (optional; helps reduce flapping)
 
 Storage requirements:
-- Small, key-value friendly, low write volume.
-- TTL possible (e.g., handled state expires after 14 days).
+- small KV footprint; low write volume
+- TTL allowed (e.g., 14 days for handled)
 
 ---
 
-## 4) Core flows
+## 4) API surfaces & contracts
 
-### 4.1 DM list load → Needs Reply labels
-**Goal:** Render DM list quickly and overlay “Needs Reply” where applicable.
+### 4.1 Inbox augmentation contract (preferred)
+Inbox response adds an optional assist object per thread:
 
-**Option A (recommended): server-augmented thread list**
-1) Client requests thread list: `GET /dm/inbox?cursor=...`
-2) Inbox service calls Conversation Health Service (or internal module) with thread summaries.
-3) Service returns: for each thread: `{needs_reply: bool, reason, score_bucket(optional)}`.
-4) Client renders list + pill if `needs_reply=true`.
+```json
+{
+  "thread_id": "t_123",
+  "...": "existing fields",
+  "assist": {
+    "needs_reply": {
+      "eligible": true,
+      "reason": "question_hint",
+      "score_bucket": "med"
+    },
+    "debug": null
+  }
+}
+```
 
-Pros: consistent cross-device, centralized cap logic, easy experiments.
-Cons: extra backend hop; must be cached and cheap.
+**Timeout behavior:** if CHS fails or times out, `assist` is omitted.
 
-**Option B: client-side heuristics**
-- Client computes “Needs Reply” using local thread metadata.
+### 4.2 Sidecar endpoint (optional fallback)
+If inbox augmentation is hard initially:
+- `GET /dm/assist/needs_reply?thread_ids=...` returns a map `thread_id -> needs_reply`.
 
-Pros: no backend changes, fast.
-Cons: inconsistent across devices, harder to evolve and audit, riskier for safety.
+Trade-off: extra round trip; can be used for staged rollout.
 
-**V1 choice:** Option A.
+### 4.3 User actions
+**Mark handled**
+- `POST /dm/assist/threads/{thread_id}/handled`
+- Request body:
 
-Latency strategy:
-- Compute labels on **thread summaries only** (no message body fetch).
-- Use a cheap scoring function; cache results for short periods (e.g., 5 minutes).
-- If assist service times out, fail open to “no label” (safe).
+```json
+{ "duration_days": 14 }
+```
 
-### 4.2 “Mark handled” action
-1) User taps overflow action on a thread: “Mark handled”.
-2) Client calls: `POST /dm/assist/threads/{thread_id}/handled`.
-3) Service stores `handled_until_ts = now + 14 days`.
-4) Client immediately hides the label (optimistic UI).
+- Response:
 
-Idempotency:
-- repeated calls safe.
+```json
+{ "handled_until_ts": 1760000000 }
+```
 
-### 4.3 Requests triage
-Requests UX is primarily client rendering + existing backend actions.
+**Idempotency:** accept `Idempotency-Key` header; repeated calls must be safe.
 
-1) Client loads Requests: `GET /dm/requests`.
-2) Server returns request items with trust signals and spam bucket classification.
-3) Client shows:
-   - signals row (verified/mutuals/etc.)
-   - Accept/Delete/Report actions
-   - separate “Likely spam” tab
+**Open Loops module**
+- `GET /dm/assist/open_loops`
+- Response:
 
-Actions:
-- `POST /dm/requests/{id}/accept`
-- `DELETE /dm/requests/{id}`
-- `POST /dm/requests/{id}/report`
+```json
+{
+  "should_show": true,
+  "items": [
+    { "type": "thread", "thread_id": "t_123", "reason": "needs_reply" },
+    { "type": "request", "request_id": "r_9", "reason": "pending_request" }
+  ],
+  "ttl_seconds": 300
+}
+```
 
-Analytics logging should include `signals_shown[]`.
-
-### 4.4 DM entry → Open Loops module
-1) Client enters DMs surface (or pulls to refresh).
-2) Client calls: `GET /dm/assist/open_loops`.
-3) Service:
-   - checks eligibility: last session > 6h, open loops count threshold, frequency cap (24h)
-   - selects top N items:
-     - Needs Reply threads (eligible + not handled)
-     - pending Requests (not acted)
-     - explicit mentions in group threads
-   - returns ordered list (simple ordering rules, not ranking)
-4) Client renders module; logs impression.
-
-Dismiss:
+**Dismiss**
 - `POST /dm/assist/open_loops/dismiss`
 
 ---
 
-## 5) Eligibility + scoring (server-side)
+## 5) Core flows (with sequencing)
 
-### 5.1 Hard exclusion gates
-Exclude thread from Needs Reply if any:
+### 5.1 DM list load → Needs Reply labels
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant I as Inbox Service
+  participant CHS as Conversation Health Service
+  C->>I: GET /dm/inbox?cursor=...
+  I->>CHS: ComputeNeedsReply(threadSummaries)
+  CHS-->>I: needs_reply map (+caps applied)
+  I-->>C: Inbox + assist fields
+```
+
+**Latency strategy**
+- CHS called with **thread summaries only**.
+- CHS has strict budget (e.g., p95 < 30–50ms). Inbox uses a tighter timeout (e.g., 20–30ms) and drops assist if exceeded.
+- CHS uses a short cache (e.g., 3–5 minutes) keyed by `(user_id, inbox_cursor/page)` or `(user_id, thread_id + summary_version)`.
+- Fail-safe: absence of labels is acceptable; do not block inbox.
+
+### 5.2 “Mark handled”
+- Client performs optimistic UI hide.
+- Server persists handled with TTL.
+
+Edge behavior:
+- If persistence fails, client may re-show later; log server errors and retry best-effort.
+
+### 5.3 Requests triage (primarily existing)
+Requests triage remains mostly client + existing backend actions. The key V2 hardening is **guardrails + consistent signals**.
+- Requests response should include stable signals and safety buckets:
+  - verified, mutual, shared groups (if allowed), account age bucket (if policy allows), spam bucket, restriction state.
+
+Actions (existing):
+- `POST /dm/requests/{id}/accept`
+- `DELETE /dm/requests/{id}`
+- `POST /dm/requests/{id}/report`
+
+### 5.4 DM entry → Open Loops module
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant CHS as Conversation Health Service
+  participant M as Messaging Backend
+  C->>CHS: GET /dm/assist/open_loops
+  CHS->>M: Fetch lightweight candidates (thread summaries + request summaries)
+  CHS-->>C: {should_show, items[], ttl}
+  C-->>CHS: POST /dm/assist/open_loops/dismiss (optional)
+```
+
+Selection rules (non-ML ranking):
+- candidates: eligible Needs Reply threads (not handled) + pending Requests + optional mentions
+- ordering: deterministic (e.g., most recent inbound first; requests before threads if in same recency band)
+- cap: 3–5 items
+
+---
+
+## 6) Eligibility & scoring (policy-safe)
+
+### 6.1 Hard exclusion gates (must-pass)
+Exclude from **Needs Reply** if any:
 - muted / archived
-- restricted / safety-sensitive states
-- blocked relationship
+- restricted / blocked / integrity-protected state
+- teen/safety-sensitive state (as defined by product policy)
 - last inbound older than 7 days
-- thread is in Requests (handled separately)
+- thread belongs to Requests (handled separately)
 - spam bucket == high confidence spam
 
-### 5.2 Scoring (lightweight)
+Exclude from **Open Loops** items if:
+- same safety gates as above
+- already acted (requests) or handled (threads)
+
+### 6.2 Lightweight scoring (illustrative)
+Use a small number of stable features; avoid “semantic intent”.
 - +3 story reply context
-- +2 in Primary inbox
-- +2 contains `?` (requires scanning last inbound text)
-- +2 sender verified
-- +1 mutual follow / graph signal
+- +2 primary folder
+- +2 `question_hint == true` (computed as a boolean; see below)
+- +2 verified sender
+- +1 mutual follow / strong graph
 - +1 inbound age ≤ 24h
 
-**Threshold:** score ≥ 4.
+Threshold: `score >= 4`.
 
-**Note on message text access:**
-- If policy/performance disallows sending message text to assist service, the inbox service can compute the presence of `?` as a boolean and pass only that.
+### 6.3 Question hint without shipping message text
+Preferred approach:
+- Inbox service computes `question_hint` using local access to the last inbound message (e.g., contains `?` in supported languages, or an existing safe “contains_question” feature), and passes only a boolean to CHS.
+
+Fallback:
+- omit `question_hint` entirely; the system still works with other features.
 
 ---
 
-## 6) Capping / saturation control
-Enforce caps server-side to prevent overwhelming users.
+## 7) Caps, anti-flapping, and consistency
 
-- Needs Reply: cap to `min(5, 10% of first-screen threads)`.
-- Open Loops: show max 3–5 items.
+### 7.1 Caps (server-side)
+- Needs Reply: cap to `min(5, 10% of first-screen threads)` per page.
+- Open Loops: cap to 3–5 items.
 - Frequency: Open Loops at most once per 24h.
 
-Implementation:
-- Cap applied per “inbox page” response.
-- Prefer to label the top eligible set using deterministic ordering (e.g., most recent inbound first) to avoid flapping.
+### 7.2 Anti-flapping
+- Deterministic ordering for the eligible set (e.g., recency) before applying caps.
+- Cache assist output for a short TTL.
+- Optional `open_loops_last_payload_hash` to avoid showing materially identical modules repeatedly across quick opens.
+
+### 7.3 Cross-device convergence
+- Handled state and Open Loops frequency stored in user-scoped KV.
+- Clients apply optimistic UI; server is source of truth.
 
 ---
 
-## 7) Experimentation & flags
-Flags:
+## 8) Observability, experimentation, and safety guardrails
+
+### 8.1 Flags
 - `dm_needs_reply_enabled`
-- `dm_requests_triage_enabled`
 - `dm_open_loops_enabled`
+- `dm_requests_triage_enabled`
 
-Variants:
-- Control: no labels/modules
-- Treatment: labels + handled + caps
-
-Assignment:
-- user-level randomization
-- cohort gating: creators/SMBs first
-
----
-
-## 8) Observability & analytics
-Minimum events (from PRD v3):
-- `dm_needs_reply_impression(thread_id, reason)`
+### 8.2 Minimum analytics events
+- `dm_needs_reply_impression(thread_id, reason, score_bucket)`
 - `dm_needs_reply_mark_handled(thread_id)`
-- `dm_open_loops_impression(count_threads, count_requests)`
+- `dm_open_loops_impression(items_count, items_types[])`
 - `dm_open_loops_dismiss`
 - `dm_request_action(request_id, action, signals_shown[])`
 
-Dashboards:
-- TTFR (median/p90)
-- CCR (24h)
-- Reports/blocks rate
-- Urgency saturation distribution
-- Time-to-first-action in Requests
+### 8.3 Guardrails (must monitor)
+- blocks/restrict actions per DAU (treatment vs control)
+- reports rate and spam exposure incidents
+- inbox latency impact (p50/p95)
+- “label fatigue”: share of users seeing >N labels/day
+- CTR to open threads from Open Loops; bounce rate
 
 ---
 
 ## 9) Failure modes & fallbacks
-- Assist service timeout → return inbox without labels/modules.
-- State store unavailable → disable “handled persistence” (labels may reappear; acceptable short-term) and log error.
-- Misclassification risk (spam surfaced) → rely on spam bucket exclusions + guardrail monitoring.
+- CHS timeout/unavailable → return inbox without labels/modules.
+- KV store partial outage → disable persistence writes (best-effort), and fall back to ephemeral behavior; log errors.
+- Misclassification (spam surfaced) → rely on strong exclusion gates; add emergency kill switch and shadow evaluation.
+- Cache poisoning/staleness → short TTLs; include summary version in cache keys.
 
 ---
 
 ## 10) Security / privacy notes
 - Avoid storing message content.
-- If using `?` heuristic, store only boolean derived feature.
-- Handled state is user action-derived and low sensitivity.
-- Ensure teen/safety-sensitive states are excluded at source.
+- Derived `question_hint` is a boolean; do not log raw text.
+- Handled state is user-action derived and low sensitivity.
+- Exclude teen/safety-sensitive accounts/threads at the earliest gate.
 
 ---
 
-## 11) Implementation plan (V1)
-1) Implement Conversation Health Service endpoints:
-   - `POST /dm/assist/threads/{thread_id}/handled`
-   - `GET /dm/assist/open_loops`
-   - `POST /dm/assist/open_loops/dismiss`
-2) Integrate label computation into inbox response (or sidecar endpoint).
-3) Client UI:
-   - Needs Reply pill + Mark handled
-   - Open Loops module + dismiss
-   - Requests triage UI (signals + actions + spam bucket tab)
-4) Instrumentation and dashboards.
+## 11) Implementation plan (V2)
+1) Harden CHS interfaces + timeouts (SLO + drop-on-timeout).
+2) Add idempotency for write endpoints (`handled`, `dismiss`).
+3) Add caching + anti-flapping for inbox augmentation and Open Loops.
+4) Ship dashboards + guardrails; staged rollout (internal → 1% → 5% → 25% → 50% → 100%).
+5) Run holdouts to detect regressions (safety + latency).
 
 ---
 
-## 12) Open questions for Architecture V2
-- Where should “handled” state live for best consistency (messaging store vs separate KV)?
-- Can inbox service compute `contains_question_mark` safely without shipping text elsewhere?
-- How to unify identity/trust signals across Primary + Requests surfaces cleanly?
+## 12) Open questions / V3 candidates
+- Best home for handled state (messaging store vs dedicated KV) given replication + costs.
+- Unifying trust/safety signal schemas across Primary/Requests to reduce client branching.
+- Extending question hint beyond `?` while staying policy-safe (language-aware heuristics or existing platform features).
