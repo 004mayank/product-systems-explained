@@ -1,15 +1,16 @@
-# Skyscanner — System Architecture (V2)
+# Skyscanner — System Architecture (V3)
 
-*(Flights-first metasearch, with Accounts + Price Alerts; adds stronger scalability, quality, and reliability patterns.)*
+*(Flights-first metasearch, with Accounts + Price Alerts; V3 deepens data contracts, scaling strategy, and operational playbooks.)*
 
-## 0) What changed vs V1
+## 0) What changed vs V2
 
-V2 focuses on:
-- **Streaming / incremental search** (SSE/WebSocket) + clearer search lifecycle
-- **Better offer quality**: canonical schema, dedupe, “best offer per itinerary”, and revalidation
-- **Provider cost control**: budgets, caching strategy, and adaptive fan-out
-- **Fraud & abuse**: bot defenses, click fraud, and provider protection
-- **Operational maturity**: SLOs, multi-region posture, and data governance
+V3 adds:
+- **Stronger data contracts**: canonical schemas, versioning, and validation at boundaries
+- **A clearer search state machine**: idempotency, TTLs, cursors, and cancellation
+- **Provider integration hardening**: connector sandboxing, quotas, backpressure, and quality scoring
+- **Offer quality pipeline**: itinerary grouping, dedupe strategy, confidence/quality signals, and revalidation patterns
+- **Operational maturity**: runbooks, failure modes, capacity levers, and DR posture
+- **Governance**: PII minimization, retention, auditability, and experiment guardrails
 
 ---
 
@@ -18,13 +19,13 @@ V2 focuses on:
 ### In-scope
 - Flight search (metasearch): query → aggregated results → filters/sort
 - Redirect/deeplink to airline/OTA for booking (no checkout)
-- User accounts
+- User accounts + preferences
 - Saved searches + price alerts (create, manage, notify)
 - Analytics + attribution for search and clickouts
 
-### Still out-of-scope
+### Out-of-scope (for now)
 - Full booking/PNR management
-- Hotels/cars/packages (can be added later with same patterns)
+- Hotels/cars/packages
 
 ---
 
@@ -40,142 +41,223 @@ V2 focuses on:
 - TLS termination
 
 ### API tier
-- API Gateway (auth, routing, quotas/rate limits)
-- BFF (Web/Mobile; can be one or split)
-- Feature flags + experimentation platform
+- API Gateway (auth, routing, rate limits, request validation)
+- BFF (one or split Web/Mobile)
+- Feature flags + experimentation
 
 ### Core domain services
 
 1) **Identity & Accounts Service**
 - signup/login, sessions, OAuth linking
-- profile: locale/currency, notification prefs
+- user profile: locale/currency, notification prefs, consent
 
 2) **Search Orchestrator**
-- owns `searchId` and lifecycle (created → running → partial → complete/expired)
-- chooses providers based on query + historical performance + cost budget
-- coordinates streaming results to client
+- owns `searchId` + lifecycle and overall time budget
+- chooses providers based on query type, past yield/latency, and cost budgets
+- aggregates + streams incremental results
 
 3) **Provider Connectors (Integration Layer)**
 - adapter per GDS/NDC/OTA/airline
 - throttling, retries, circuit breakers, idempotency
-- response sampling + provider-specific parsing
+- parsing + normalization pre-checks
 
 4) **Offer Normalization & Enrichment**
-- canonical `Itinerary`/`Offer` model
-- currency conversion (FX)
-- baggage/fare rules normalization
-- dedupe + “same itinerary” grouping
+- canonical `Itinerary`/`Offer` schema
+- currency conversion, baggage/fare rules normalization
+- dedupe + itinerary grouping
 
 5) **Ranking, Sorting & Facets**
-- compute Best/Cheapest/Fastest
-- stable facet model + pagination/cursors
-- (optional) lightweight personalization/learning-to-rank later
+- Best/Cheapest/Fastest
+- consistent facet model, stable pagination/cursors
 
-6) **Pricing / Revalidation Service**
-- optional “freshness check” before redirect (provider terms permitting)
-- marks offer as stale/changed and returns next-best alternatives
+6) **Pricing / Revalidation Service (optional)**
+- freshness check before redirect (where allowed)
+- handles “changed/stale” outcomes and alternatives
 
 7) **Redirect/Deeplink Service**
 - signed click tokens, affiliate params, replay protection
-- emits click event and fraud signals
+- click event emission + fraud features
 
 8) **Saved Searches & Alerts Service**
 - saved search definitions
-- alert rules (threshold, direction, frequency)
+- alert rules (threshold/direction/frequency)
 
 9) **Notifications Service**
-- email/SMS/push via providers
-- templating, retries, dedupe, unsubscribe management
+- email/SMS/push providers
+- templating, retries, dedupe, unsubscribe
 
 10) **Tracking & Attribution**
 - search/click/alert events
-- attribution stitching (campaigns, partner tracking)
-- fraud detection hooks
+- attribution stitching + partner reporting feeds
 
 ### Platform/data
-- **Redis**: search sessions, partial results, hot reference caches
+- **Redis**: search sessions + partial results (short TTL), hot reference caches
 - **Relational DB** (Postgres/MySQL): users, saved searches, alerts, preferences
-- **Event bus/stream** (Kafka/PubSub): clickstream, alert triggers, provider health events
+- **Event bus/stream** (Kafka/PubSub): clickstream, alert triggers, provider health, quality events
 - **Warehouse/lake** (BigQuery/Snowflake/S3): analytics + price history
 - Observability: logs/metrics/traces, SLO dashboards
 
 ---
 
-## 3) Search lifecycle & APIs (V2)
+## 3) Search lifecycle & API contracts (V3)
 
-### 3.1 Create search
+### 3.1 Canonical request normalization
+Before any provider calls, Orchestrator performs:
+- airport/city resolution + timezone-safe date handling
+- passenger/cabin normalization
+- locale/currency normalization + FX strategy
+- policy enforcement: max date range, max pax, bot score threshold
+
+Produces a **NormalizedQuery** (stable hashable form):
+- `queryHash = sha256(normalizedQueryJson)`
+
+### 3.2 Create search
 `POST /search`
-- Request: origin/destination, dates, pax, cabin, locale/currency, flexibility, filters
+- Request: route, dates, pax, cabin, locale/currency, flexibility, filters
 - Response: `{ searchId, streamUrl, expiresAt }`
 
-**Key V2 ideas**
-- Orchestrator sets a **time budget** (e.g., 8–12s) and **provider budgets** (per query class).
-- Results are produced incrementally.
+**Idempotency**
+- Support `Idempotency-Key` header.
+- If the same key is reused (within TTL), return the same `searchId`.
 
-### 3.2 Stream results (recommended)
+**SearchSession**
+- persisted in Redis: `{ searchId, queryHash, createdAt, status, budgets, providerPlan, expiresAt }`
+
+### 3.3 State machine
+States (example):
+- `CREATED` → `RUNNING` → `PARTIAL` → `COMPLETE`
+- terminal variants: `CANCELLED`, `EXPIRED`, `FAILED`
+
+Transitions:
+- `RUNNING` emits incremental batches.
+- `PARTIAL` is acceptable end-state when time budget is exceeded.
+
+### 3.4 Streaming results (recommended)
 `GET /search/{searchId}/stream` via **SSE** (or WebSocket)
-- emits:
-  - `SearchStarted`
-  - `ProviderStatus` (started/timeout/error)
-  - `ResultBatch` (offers/itineraries delta)
-  - `SearchComplete`
+
+Event types:
+- `SearchStarted`
+- `ProviderStatus` (started/timeout/error/throttled)
+- `ResultBatch` (delta offers/itineraries)
+- `SearchComplete` (final stats + completeness)
 
 Fallback polling:
 `GET /search/{searchId}/results?cursor=...`
 
-### 3.3 Result shaping
-To reduce payload size and duplicate offers:
-- Normalize to canonical itineraries.
-- Compute **OfferGroups**: “best offer per itinerary” plus alternates.
-- Paginate on groups (stable cursor), not raw offers.
+### 3.5 Pagination & stability guarantees
+To reduce payload and make cursors stable:
+- paginate on **Itinerary groups** (`OfferGroup`) not raw offers
+- cursor references a deterministic ordering key:
+  - `(sortKey, groupId)` where `sortKey` is computed from normalized fields
 
-### 3.4 Degraded mode
-- Partial provider failures → still return results.
-- If budgets are exceeded, stop slow providers and mark as `timed_out`.
+### 3.6 Cancellation
+`POST /search/{searchId}/cancel`
+- stops new provider fan-out
+- keeps already-returned results until TTL expiry
 
 ---
 
-## 4) Redirect & revalidation (V2)
+## 4) Provider fan-out strategy & backpressure
 
-### 4.1 Redirect
+### 4.1 Budgeting
+- global time budget: e.g., 8–12s
+- per-provider timeouts: e.g., 1–4s (tiered by provider latency)
+- cost budget: max calls/search, max QPS/provider, max $/search proxy
+
+### 4.2 Adaptive fan-out (progressive disclosure)
+Start with a **core provider set** and expand if:
+- yield is low
+- query is complex (multi-leg/long-haul)
+- user explicitly requests “show more” / scrolls
+
+### 4.3 Backpressure & overload behavior
+- queue-based connector execution with bounded concurrency
+- when overloaded:
+  - shed non-core providers first
+  - degrade to cached/summary responses where allowed
+  - return `PARTIAL` with clear completeness metadata
+
+---
+
+## 5) Offer quality pipeline (V3)
+
+### 5.1 Canonical schemas (contracts)
+Define explicit versions:
+- `ItinerarySchema vX`
+- `OfferSchema vX`
+- `FareRulesSchema vX`
+
+Enforce at boundaries:
+- connectors validate provider payload → internal contract
+- Orchestrator validates internal contract → API response contract
+
+### 5.2 Dedupe + grouping
+Core idea: one “itinerary identity” per unique trip.
+- compute `itinKey` from normalized segments, times (rounded rules), carriers, cabin
+- group offers by `itinKey`
+
+`OfferGroup` contains:
+- best offer (by price + quality)
+- alternates (same itinerary, different provider)
+
+### 5.3 Quality / confidence signals
+Maintain per-offer signals:
+- provider reliability score (timeouts, change rate)
+- freshness score (time since fetched)
+- rules completeness (baggage/fare rules coverage)
+- anomaly score (very low price, suspicious taxes)
+
+Use these in ranking and revalidation decisions.
+
+---
+
+## 6) Redirect & revalidation patterns
+
+### 6.1 Redirect
 `POST /redirect` with `{ searchId, offerId }`
-- Redirect Service:
-  - validates offer TTL
-  - optionally requests **revalidation** for top offers
-  - signs redirect token (short TTL)
-  - emits click event + fraud features
-- Returns 302 to airline/OTA
+- validate offer existence + TTL
+- optionally revalidate
+- issue signed redirect token (short TTL) + affiliate params
+- emit click event + fraud features
+- return 302
 
-### 4.2 Revalidation rules
-- Only revalidate when:
-  - offer is near TTL
-  - provider has high change rate
-  - fare is unusually low (fraud/price error risk)
-- If changed:
-  - return updated price or next-best alternative
+### 6.2 Revalidation policy
+Revalidate when:
+- offer near TTL
+- provider has high “change rate”
+- anomaly score is high
+
+Outcomes:
+- `VALID` → redirect
+- `CHANGED` → return updated price + ask user to confirm
+- `STALE` → return next-best alternatives
+
+**Idempotency**
+- `POST /redirect` accepts `Idempotency-Key` to prevent duplicate click events.
 
 ---
 
-## 5) Price alerts (V2)
+## 7) Price alerts pipeline (V3)
 
-### 5.1 Alert evaluation pipeline
-1) User creates alert: `POST /alerts`
-2) Alerts Service enqueues tracking jobs (schedule/frequency)
-3) **Batch Search Workers** run search in “batch mode” via Orchestrator
-4) Store observations: min/median price, provider mix, confidence
-5) Trigger rules:
-   - absolute threshold
-   - % drop over baseline
-   - best-in-N-days
-6) Emit `AlertTriggered` event → Notifications
+### 7.1 Batch search mode
+Alerts run searches in a **batch mode**:
+- stricter cost budgets
+- fewer providers by default
+- consistent schedule jitter + dedupe
 
-### 5.2 Notification dedupe
-- idempotency key: `(alertId, observedAt_bucket, triggerType)`
+### 7.2 Observation model
+Store:
+- `minPrice`, `medianPrice`, `sampleCount`
+- provider mix metadata
+- confidence score
+
+### 7.3 Triggering + notification dedupe
+- idempotency key: `(alertId, timeBucket, triggerType)`
 - per-channel retry with dedupe store
 
 ---
 
-## 6) Data model (conceptual)
+## 8) Data model (conceptual)
 
 ### Identity
 - `User(id, email/phone, createdAt, locale, currency, consentFlags)`
@@ -183,10 +265,10 @@ To reduce payload size and duplicate offers:
 - `NotificationPreference(userId, channels, quietHours, frequency)`
 
 ### Search / offers
-- `SearchSession(searchId, normalizedQuery, createdAt, status, expiresAt)`
+- `SearchSession(searchId, queryHash, createdAt, status, expiresAt)`
 - `Itinerary(itinId, legs[], segments[], carriers, duration, stops)`
-- `Offer(offerId, itinId, providerId, price, currency, fareRules, baggage, ttl, qualityScore)`
-- `OfferGroup(groupId, itinId, bestOfferId, alternateOfferIds[])`
+- `Offer(offerId, itinId, providerId, price, currency, fareRules, baggage, ttl, qualitySignals)`
+- `OfferGroup(groupId, itinKey, bestOfferId, alternateOfferIds[])`
 
 ### Alerts
 - `SavedSearch(id, userId, normalizedQuery, createdAt)`
@@ -195,58 +277,74 @@ To reduce payload size and duplicate offers:
 
 ---
 
-## 7) Caching, cost controls & provider protection
+## 9) Caching, retention & governance
 
-### 7.1 Caching
-- Redis:
-  - search sessions + partial results (TTL minutes)
-  - reference data (airports/airlines/FX) longer TTL
-- Edge caching for reference endpoints
-- Provider response caching:
-  - very short TTL, provider-specific, respect terms
+### 9.1 Caching
+- Redis search state + partial results (TTL minutes)
+- reference data (airports/airlines/FX) longer TTL
+- provider response caching: very short TTL, provider-specific, respect terms
 
-### 7.2 Adaptive fan-out
-- Start with a **core provider set**, then expand if:
-  - yield is low
-  - query is long-haul/complex
-  - user scrolls / requests more
-- Per-provider concurrency caps + circuit breakers
+### 9.2 Data retention (principles)
+- minimize PII in event streams
+- set explicit retention:
+  - raw clickstream: short/medium
+  - aggregated metrics: long
+  - alert observations: long (for trends)
+
+### 9.3 Auditability
+- audit trails for:
+  - consent changes
+  - notification sends/unsubscribes
+  - partner reporting exports
 
 ---
 
-## 8) Security, privacy, abuse & fraud
+## 10) Security, privacy, abuse & fraud
 
 - Bot mitigation on `POST /search` (cost amplification) and `POST /redirect` (click fraud)
 - Signed redirect tokens (short TTL) + replay protection
-- Consent gating for analytics/ads tracking
 - Encrypt sensitive fields at rest; avoid PII in logs
-- Unsubscribe + notification audit trails
+- Consent gating for analytics/ads tracking
+- Abuse hooks:
+  - per-IP/device rate limits
+  - suspicious query patterns
+  - click fraud feature store inputs
 
 ---
 
-## 9) Reliability, SLOs & multi-region posture
+## 11) Reliability, SLOs, and DR posture
 
-### Targets (example)
+### SLO targets (example)
 - Search first results p95: **< 2s**
-- Search completion window: **5–15s** (depending on query/providers)
+- Search completion window: **5–15s**
 - Redirect p95: **< 300ms**
 - Alerts: trigger within schedule window (e.g., **< 15 min** jitter)
 
-### Multi-region (optional)
-- Active-active for stateless tiers (Gateway/BFF/Orchestrator)
-- Regional connector pools (reduce latency to providers)
-- Data:
-  - user DB: primary + read replicas (or multi-region DB)
-  - search session cache: regional Redis with TTL
+### Failure modes (expected)
+- provider partial outages → return `PARTIAL`
+- connector overload → shed non-core providers
+- Redis issues → fall back to stateless limited mode (reduced streaming/history)
+
+### Multi-region
+- active-active for stateless tiers (Gateway/BFF/Orchestrator)
+- regional connector pools (closer to providers)
+- data:
+  - primary + replicas (or multi-region DB)
+  - regional Redis with TTL; tolerate cache loss
+
+### Disaster recovery
+- define RPO/RTO per subsystem
+- rehearse provider failover + traffic shifting
 
 ---
 
-## 10) Observability & business metrics
+## 12) Observability & business metrics
 
 ### Tech
-- distributed tracing: BFF → orchestrator → connectors
+- distributed tracing: BFF → Orchestrator → Connectors
 - provider health dashboards: timeout/error/throttle rates
-- cost dashboards: calls/search, provider spend proxy
+- cost dashboards: calls/search, connector queue depth
+- quality dashboards: dedupe rate, revalidation change rate
 
 ### Biz
 - search success rate & yield (offers/search)
@@ -256,7 +354,7 @@ To reduce payload size and duplicate offers:
 
 ---
 
-## 11) Minimal deployment view (ASCII)
+## 13) Minimal deployment view (ASCII)
 
 ```
 Clients -> CDN/WAF -> API Gateway -> BFF
