@@ -1,16 +1,16 @@
-# Skyscanner — System Architecture (V3)
+# Skyscanner — System Architecture (V4)
 
-*(Flights-first metasearch, with Accounts + Price Alerts; V3 deepens data contracts, scaling strategy, and operational playbooks.)*
+*(Flights-first metasearch, with Accounts + Price Alerts; V4 deepens ranking/quality signals, real‑time pricing freshness, and platform reliability/analytics patterns.)*
 
-## 0) What changed vs V2
+## 0) What changed vs V3
 
-V3 adds:
-- **Stronger data contracts**: canonical schemas, versioning, and validation at boundaries
-- **A clearer search state machine**: idempotency, TTLs, cursors, and cancellation
-- **Provider integration hardening**: connector sandboxing, quotas, backpressure, and quality scoring
-- **Offer quality pipeline**: itinerary grouping, dedupe strategy, confidence/quality signals, and revalidation patterns
-- **Operational maturity**: runbooks, failure modes, capacity levers, and DR posture
-- **Governance**: PII minimization, retention, auditability, and experiment guardrails
+V4 adds:
+- **Learning-to-rank & personalization**: offline training + online feature serving, guardrails, and explainable “Best” sort
+- **Price freshness at scale**: revalidation tiers, stale/changed handling, and cache invalidation strategy
+- **Unified quality signals**: provider reliability scoring, itinerary/offer confidence, and anti-fraud signals feeding ranking
+- **Experimentation discipline**: metric trees, counterfactual logging, and partner/affiliate-safe attribution
+- **Reliability patterns**: multi-region search orchestration, graceful degradation, and cost-aware autoscaling
+- **Data products**: clickstream contracts, price-history pipelines, and alert trigger correctness guarantees
 
 ---
 
@@ -99,7 +99,7 @@ V3 adds:
 
 ---
 
-## 3) Search lifecycle & API contracts (V3)
+## 3) Search lifecycle & API contracts (V4)
 
 ### 3.1 Canonical request normalization
 Before any provider calls, Orchestrator performs:
@@ -179,7 +179,7 @@ Start with a **core provider set** and expand if:
 
 ---
 
-## 5) Offer quality pipeline (V3)
+## 5) Offer quality pipeline (V4)
 
 ### 5.1 Canonical schemas (contracts)
 Define explicit versions:
@@ -209,6 +209,28 @@ Maintain per-offer signals:
 
 Use these in ranking and revalidation decisions.
 
+### 5.4 Ranking & personalization (V4)
+Ranking typically produces multiple “views” (Best/Cheapest/Fastest) while keeping pagination stable.
+
+**Approach**
+- Stage 1: hard filters + itinerary grouping (remove invalid/duplicate)
+- Stage 2: candidate scoring (hand-tuned + learned)
+- Stage 3: business rules (sponsored constraints, partner exclusions, safety)
+
+**Learning-to-rank (LTR)**
+- Offline training on logged impressions/clickouts/conversions
+- Counterfactual logging (position + alternatives) to reduce bias
+- Feature store / online feature serving for:
+  - price competitiveness vs historical baseline
+  - provider reliability + change rate
+  - itinerary quality (layovers, airport changes, red-eyes)
+  - user context (locale, device, prior behavior) with strict consent
+
+**Guardrails**
+- Never rank “too good to be true” offers above a confidence threshold without revalidation
+- Explainable contributions for “Best” (price + duration + stops + reliability)
+- Monitoring for metric regressions, partner mix drift, and fairness across segments
+
 ---
 
 ## 6) Redirect & revalidation patterns
@@ -237,7 +259,7 @@ Outcomes:
 
 ---
 
-## 7) Price alerts pipeline (V3)
+## 7) Price alerts pipeline (V4)
 
 ### 7.1 Batch search mode
 Alerts run searches in a **batch mode**:
