@@ -16,18 +16,27 @@
 
 **Version history**
 - **V1:** Conceptual decomposition + end-to-end flows + trade-offs
-- **V2 (current):** Adds explicit **NFRs/SLOs**, **sizing assumptions**, **API/event contracts**, **partitioning/idempotency**, **cache strategy**, and more concrete **degraded-mode** policies.
+- **V2:** Adds explicit **NFRs/SLOs**, **sizing assumptions**, **API/event contracts**, **partitioning/idempotency**, **cache strategy**, and more concrete **degraded-mode** policies.
+- **V3 (this doc):** Tightens the **end-to-end story** with **sequence flows**, adds **hard problems** (privacy changes, deletes, backfills), clarifies **fanout strategies**, and adds **operational playbooks** (budgets, retries, poison pills).
 
-**Scope (V2)**
-- Content creation → ingestion → enrichment
-- Feed: candidate generation → ranking → serving → feedback
-- Notifications: event → recipient expansion → eligibility/rules → ranking/bundling → delivery → feedback
-- Cross-cutting: identity/graph, privacy/policy, experimentation, observability, reliability
+---
 
-**Non-goals**
-- Exact model architectures, feature lists, or confidential thresholds
-- Ads auction internals (we note where ads plug in)
-- Full trust & safety moderation system design (we only include policy gates relevant to distribution)
+## Table of contents
+
+- [0) Mental model](#0-mental-model)
+- [1) Non-functional requirements (NFRs) / SLOs](#1-non-functional-requirements-nfrs--slos)
+- [2) Back-of-envelope sizing](#2-back-of-envelope-sizing)
+- [3) High-level architecture](#3-high-level-architecture)
+- [4) Data model (key entities)](#4-data-model-key-entities)
+- [5) Event-driven foundation: ingestion + enrichment](#5-event-driven-foundation-ingestion--enrichment)
+- [6) Feed: candidate generation → ranking → serving](#6-feed-candidate-generation--ranking--serving)
+- [7) Notifications: event → recipient expansion → policy/ranking → delivery](#7-notifications-event--recipient-expansion--policyranking--delivery)
+- [8) Contracts: schemas + partitioning + idempotency](#8-contracts-schemas--partitioning--idempotency)
+- [9) Caches, precomputes, and fanout strategies](#9-caches-precomputes-and-fanout-strategies)
+- [10) Degraded modes / load shedding](#10-degraded-modes--load-shedding)
+- [11) Observability + ops playbooks](#11-observability--ops-playbooks)
+- [12) Trade-offs and design choices](#12-trade-offs-and-design-choices)
+- [13) Appendix: “hard cases” checklist](#13-appendix-hard-cases-checklist)
 
 ---
 
@@ -48,38 +57,42 @@ They share primitives:
 - **relevance scoring** + **feedback loops**
 
 A practical way to think about it:
-- Feed = **supply matching + ranking**
-- Notifications = **attention management** (interrupt vs batch) using many of the same signals
+- Feed = **supply matching + ranking** (limited “slots” on screen)
+- Notifications = **attention management** (interrupt vs batch), using many of the same signals
+
+**Key difference:**
+- Feed is often **session-scoped ranking** (what’s best *for this session*), tolerant of slight staleness.
+- Notifications are often **event-scoped** (this event happened), less tolerant of missing a critical event, but must control spam.
 
 ---
 
-## 1) Non-functional requirements (NFRs) / SLOs (V2)
+## 1) Non-functional requirements (NFRs) / SLOs
 
-These are indicative targets for a large consumer social network.
+Indicative targets for a large consumer social network.
 
 ### Feed latency
 - **Home feed request end-to-end:** p50 < **200 ms**, p95 < **600 ms** (server-side), excluding network
 - **Candidate gather stage:** p95 < **150 ms**
-- **Heavy ranking stage:** p95 < **250 ms** (often via model server + feature fetch)
+- **Heavy ranking stage:** p95 < **250 ms** (model server + feature fetch)
 
 ### Notifications latency
-- **Direct social events (comment on your post, mention, connection request):** p95 < **2 s** to in-app notification record
+- **Direct social events** (comment on your post, mention, connection request): p95 < **2 s** to in-app notification record
 - **Push dispatch for high-priority:** p95 < **10 s** from event commit (provider throttles may extend)
 
 ### Availability / durability
 - Feed serving availability **99.95%** monthly (degraded ranking allowed)
 - Notification pipeline availability **99.95%** monthly
-- At-least-once stream processing + **idempotent writes**; bounded duplication is acceptable
+- At-least-once processing + **idempotent writes**; bounded duplication is acceptable
 
-### Cost constraints
-- Avoid per-request heavy joins; rely on **precomputed indexes + caches**
-- Prefer metadata-only push payloads; clients fetch full content via authenticated APIs
+### Correctness & safety
+- **Fail-closed** for user-respecting policy (privacy/blocks/mute). If uncertain, suppress or degrade rather than leak.
+- Deletes and privacy changes should converge quickly: “soft guarantee” within **minutes**, “hard” within **hours** (via backfill sweeps).
 
 ---
 
-## 2) Back-of-envelope sizing (assumptions → derived QPS)
+## 2) Back-of-envelope sizing
 
-Numbers are illustrative; the goal is to reason about hotspots and partitioning.
+Numbers are illustrative; goal is to reason about hotspots and partitioning.
 
 ### Example assumptions
 - Daily active members (DAU): **50M**
@@ -87,13 +100,12 @@ Numbers are illustrative; the goal is to reason about hotspots and partitioning.
 - Avg feed items served per open: **30**
 - New content objects/day (posts + reshares): **50M**
 - Engagement events/day (reactions + comments): **500M**
-- Peak-to-average ratio: **8×** (diurnal + spikes)
+- Peak-to-average ratio: **8×**
 
 ### Derived volumes (rough)
 - **Feed requests/day:** 50M × 5 = **250M** → avg **~2.9k req/s**, peak **~23k req/s**
 - **Items served/day:** 250M × 30 = **7.5B items/day**
 - **Event ingest (engagement):** 500M/day → avg **~5.8k events/s**, peak **~46k events/s**
-- **Notification candidates:** depends heavily on recipient expansion (comments/reactions can notify multiple parties); design must handle **fan-out amplification**.
 
 Implication: hottest paths are:
 - feed request fan-out (candidate gather + ranking)
@@ -118,14 +130,14 @@ Implication: hottest paths are:
           |                               |
           v                               v
 +--------------------+         +---------------------+
-| Feed Serving        | -----> | Feed Candidate Gen  |
-| (cache + paginate)  |        | (multi-source)      |
+| Feed Serving       | ----->  | Feed Candidate Gen  |
+| (cache + paginate) |         | (multi-source)      |
 +---------+----------+         +----------+----------+
           |                               |
           v                               v
 +--------------------+         +---------------------+
-| Feed Ranking        | <----> | Feature Store /     |
-| (multi-stage)       |        | Enrichment outputs  |
+| Feed Ranking       | <-----> | Feature Store /     |
+| (multi-stage)      |         | Enrichment outputs  |
 +---------+----------+         +----------+----------+
           |                               |
           v                               v
@@ -143,16 +155,16 @@ Write + event foundation
           |                               |
           v                               v
 +--------------------+         +---------------------+
-| Entity Store +      |       | Enrichment Pipeline |
-| Indexes             |       | (spam, topics, etc) |
+| Entity Store +     |         | Enrichment Pipeline |
+| Indexes            |         | (spam, topics, etc) |
 +--------------------+         +---------------------+
 
 Notifications path
 
-Event Stream / Log -> Notification Orchestrator -> Notif Policy/Ranking -> Delivery (push/in-app/email)
-                                 |                         |
-                                 v                         v
-                          Prefs/Settings             Notification State Store
+Event Stream / Log -> Notification Orchestrator -> Policy/Ranking -> Delivery (push/in-app/email)
+                                 |                      |
+                                 v                      v
+                          Prefs/Settings            Notification State Store
 ```
 
 ---
@@ -176,7 +188,7 @@ Stores / indexes you’d expect:
 
 ## 5) Event-driven foundation: ingestion + enrichment
 
-### 5.1 Write path
+### 5.1 Write path (authoring)
 1. Client calls `CreatePost` / `CreateComment` / `React`.
 2. Write API validates auth + basic policy (rate limits, blocks, restricted content).
 3. Entity is persisted.
@@ -189,32 +201,59 @@ Async consumers attach metadata used by feed/notifs:
 - author reputation signals
 - entity embeddings (optional)
 
-Design principle: **don’t block writes** on enrichment; downstream systems should handle partial features.
+Design principle: **don’t block writes** on enrichment; downstream systems should tolerate partial features.
+
+### 5.3 “Correction” events
+To handle edits/deletes/privacy changes you typically also need:
+- `PostUpdated` / `PostVisibilityChanged`
+- `PostDeleted` (tombstone)
+- `MemberBlocked` / `Unblocked`
+
+These are crucial for feed/notifs convergence.
 
 ---
 
-## 6) Feed (V2): candidate generation → ranking → serving
+## 6) Feed: candidate generation → ranking → serving
 
 ### 6.1 Candidate sources
-For viewer `V`, candidates typically come from multiple sources:
+For viewer `V`, candidates commonly come from:
 - **Network**: posts from connections, followed people/companies
 - **Neighborhood**: 2-hop graph; “people in your ecosystem”
-- **Topic / interest**: communities, hashtags, inferred interests
-- **Search / intent**: if the session implies job seeking, hiring, learning, etc.
+- **Topic / interest**: hashtags, topics, inferred interests
+- **Intent / session context**: job seeking, hiring, learning
 - **Exploration**: controlled testing of new creators/topics
 
-### 6.2 Candidate generation architecture
+### 6.2 Feed request flow (sequence)
+
+```text
+Client
+  |  GET /v1/home-feed?cursor&limit
+  v
+Read API / Edge
+  |-- fetch experiment bucket (sticky) -------------------->
+  |-- fetch viewer snapshot (prefs, locale, blocks) ------->
+  |-- gather candidates (multi-source, cached indexes) ---->
+  |-- policy filter (visibility/blocks/safety) ------------>
+  |-- light rank (fast) ----------------------------------->
+  |-- heavy rank (model + online features) ---------------->
+  |-- post-process (diversity, freshness, dedupe) --------->
+  |-- write impression log async -------------------------->
+  v
+Response (items + cursor)
+```
+
+### 6.3 Candidate generation architecture
 At request time (fanout-on-read), gather candidate IDs from:
 - graph-based indexes (connections/follows)
 - topic/trending indexes
-- recent-engagement indexes (e.g., “new comments on posts you engaged with”)
+- “recently engaged” indexes (e.g., “new comments on posts you interacted with”)
 
 To keep latency low:
 - use **precomputed candidate pools** for some sources (e.g., “top posts in topic T today”)
 - cache “viewer neighborhood” expansions (connections/follows)
 
-### 6.3 Ranking: multi-stage
-A common pattern:
+### 6.4 Ranking: multi-stage
+Common pattern:
 1) **Policy filter**
    - visibility, blocks, spam suppression
 2) **Light ranker** (fast)
@@ -224,13 +263,20 @@ A common pattern:
 4) **Post-processing**
    - diversity constraints (authors/topics)
    - freshness mix
-   - session-level dedupe (don’t show same post repeatedly)
+   - session-level dedupe (avoid repeat exposures)
 
-### 6.4 Feed serving + pagination
+Typical feature groups (plausible):
+- viewer↔author affinity (graph distance, prior interactions)
+- content quality (author reputation, spam score)
+- freshness/velocity (recent engagement rate)
+- topical relevance (topics, embeddings)
+- negative feedback risk (hide/report propensity)
+
+### 6.5 Feed serving + pagination
 Concerns:
 - stable pagination tokens (avoid duplicates/holes)
-- cache top-N short window (seconds to minutes)
-- consistent **experiment assignment** for member
+- cache top-N for short windows (seconds to minutes)
+- consistent **experiment assignment** per member
 
 #### API contract (example)
 `GET /v1/home-feed?member_id=...&cursor=...&limit=30`
@@ -248,7 +294,7 @@ Response:
 }
 ```
 
-### 6.5 Feedback loop
+### 6.6 Feedback loop
 Capture and stream:
 - impressions, dwell, clicks
 - likes/comments/shares
@@ -262,9 +308,36 @@ Use these for:
 
 ---
 
-## 7) Notifications (V2): event → recipient expansion → policy/ranking → delivery
+## 7) Notifications: event → recipient expansion → policy/ranking → delivery
 
-### 7.1 Notification candidate creation (orchestration)
+### 7.1 Notification orchestration flow (sequence)
+
+```text
+Write API commits CommentCreated
+  |
+  |  publish CommentCreated(event_id, post_id, actor_id, mentions[])
+  v
+Event Stream
+  |
+  |  Notification Orchestrator consumes
+  |    - expand recipients (author, mentions, thread participants)
+  |    - generate candidates with dedupe_key
+  v
+Notification State Store (idempotent upsert)
+  |
+  |  Policy / Budgeting
+  |    - prefs, blocks, quiet hours
+  |    - per-recipient rate limits (push budget)
+  v
+Delivery Router
+  |-- in-app record available immediately
+  |-- push dispatch for eligible/high-priority
+  |-- optional email/digest
+  v
+Provider (APNs/FCM/Email)
+```
+
+### 7.2 Recipient expansion
 A **Notification Orchestrator** consumes events and expands recipients.
 
 Examples:
@@ -274,7 +347,12 @@ Examples:
 
 Output: `NotificationCandidateCreated` events.
 
-### 7.2 Hard policy / eligibility gates
+**Fanout control:** Recipient expansion is the “blast radius” step. It typically needs:
+- caps per event (e.g., thread participants capped)
+- sampling for low-priority edges
+- batching (write candidates in chunks)
+
+### 7.3 Hard policy / eligibility gates
 Before ranking/delivery:
 - member settings (mute types)
 - blocks/privacy
@@ -282,16 +360,21 @@ Before ranking/delivery:
 - dedupe/idempotency
 - safety policy gates (don’t push unsafe content)
 
-### 7.3 Ranking + bundling
+### 7.4 Ranking + bundling
 Notifications compete for attention.
 
-V2 recommends explicit primitives:
-- **Priority tier** (P0 security, P1 direct social, P2 network activity, P3 marketing)
-- **Bundle key** for aggregation:
+Useful primitives:
+- **Priority tier**
+  - P0 security, P1 direct social, P2 network activity, P3 marketing
+- **Bundle key** for aggregation
   - e.g., `bundle_key = recipient_id + ":" + post_id + ":" + type`
 - **Quiet hours / digest windows**
 
-### 7.4 Delivery channels
+Bundling examples:
+- “X and 12 others reacted to your post”
+- “New comments on a post you follow”
+
+### 7.5 Delivery channels
 - In-app: reliable and cheap
 - Push: interruptive, must be budgeted and bundled
 - Email: digests, alerts (user-controlled)
@@ -301,17 +384,17 @@ Delivery service responsibilities:
 - retries/backoff
 - write delivery outcomes to notification state store
 
-### 7.5 Notification state machine
+### 7.6 Notification state machine
 States:
 - `candidate` → `suppressed|bundled|delivered` → `opened|dismissed`
 
 Idempotent keys:
-- candidate dedupe: `recipient_id + event_id + type`
+- candidate dedupe: `recipient_id + source_event_id + type`
 - push attempt dedupe: `notification_id + device_id + channel`
 
 ---
 
-## 8) Contracts (V2): event schemas + partitioning/idempotency
+## 8) Contracts: schemas + partitioning + idempotency
 
 Assume a durable log (Kafka/Pulsar/Kinesis-like).
 
@@ -370,11 +453,9 @@ Ordering guarantees:
 
 ---
 
-## 9) Cache strategy (V2)
+## 9) Caches, precomputes, and fanout strategies
 
-Caches are essential to hit SLOs.
-
-What to cache:
+### 9.1 What to cache
 - viewer graph neighborhood expansions (connections/follows)
 - per-member preference snapshots (notification settings)
 - hot entity aggregates (recent engagement velocity)
@@ -385,12 +466,25 @@ TTL guidance (indicative):
 - prefs snapshots: 10–60s (invalidate on change events)
 - velocity counters: seconds
 
-Consistency posture:
-- be **fail-closed** on user-respecting suppressions (if mute/DND is uncertain, prefer suppress/batch over push)
+### 9.2 Fanout options
+
+**Fanout-on-read (typical for large feeds)**
+- Pros: avoids massive write amplification; adapts ranking per session
+- Cons: expensive read path; needs aggressive caching/precompute
+
+**Fanout-on-write (classic “push feed”)**
+- Pros: very fast reads; simple serving
+- Cons: huge write amplification (celebrity problem), hard to re-rank
+
+**Hybrid**
+- Fanout-on-write for *bounded* audiences (e.g., your direct connections)
+- Fanout-on-read for broader discovery sources
+
+LinkedIn-like systems often land in hybrid territory.
 
 ---
 
-## 10) Degraded modes / load shedding (V2)
+## 10) Degraded modes / load shedding
 
 Hotspots are dominated by fan-out:
 - viral posts causing huge reaction/comment volume
@@ -402,36 +496,56 @@ Explicit degraded policies:
 2) Widen bundling windows (e.g., 30s → 5m)
 3) Switch some notifications to **in-app only** (no push)
 4) Feed ranking fallback:
-   - if heavy ranker down, use light ranker + cached top posts
+   - if heavy ranker down, use light ranker + cached candidate pools
 5) Admission control:
    - cap per-entity fan-out work; sample low-priority recipients
 
 ---
 
-## 11) Observability (V2)
+## 11) Observability + ops playbooks
 
-Feed:
+### Feed
 - request latency (p50/p95), candidate count, cache hit rates
 - CTR/dwell, hides/reports
 - diversity metrics (author/topic concentration)
 
-Notifications:
+### Notifications
 - candidates created/s, suppressed/bundled/delivered rates
 - pushes/member/day (p50/p95), open rate by type
 - provider error rates + throttling
 
-Guardrails:
-- sudden increase in pushes/member or hides/reports
-- stream lag, ranking latency spikes
+### Pipeline health
+- stream lag per consumer group
+- DLQ / poison-pill rate (bad events)
+- idempotency conflict rate (unexpected duplicates)
+
+### Common playbooks
+- **Provider throttling spike:** switch to in-app-only for P2/P3; widen bundling; reduce concurrency
+- **Consumer lag:** scale consumers; pause low-priority topics; ensure backpressure works
+- **Bad deploy in ranking:** flip experiment flag to fallback; serve cached pools; alert on guardrails
 
 ---
 
-## 12) Trade-offs
+## 12) Trade-offs and design choices
 
 - Fanout-on-read vs hybrid fanout-on-write
 - Multi-stage ranking to balance latency and quality
 - Push aggressiveness vs long-term engagement (budgets, digests)
 - Eventual consistency acceptable for counts/digests; stronger consistency needed for settings and security notifications
+
+---
+
+## 13) Appendix: hard cases checklist
+
+Things that break naive designs:
+
+- **Privacy change after distribution** (visibility narrowed): ensure previously eligible items/notifs are suppressed going forward; consider retrospective cleanup sweeps.
+- **Delete/tombstone:** remove from caches; invalidate feed cursors where possible; suppress pending notifications.
+- **Block/mute changes:** fail-closed; propagate quickly; ensure cache invalidation.
+- **Idempotency:** at-least-once streams produce duplicates; require dedupe keys + idempotent upserts.
+- **Backfills:** replay events to rebuild indexes; require versioned schemas and reprocessing safety.
+- **Celebrity problem:** writer has tens of millions of followers → avoid fanout-on-write explosion.
+- **Notification spam:** without budgets/bundles, user churn increases; require per-recipient caps and quiet hours.
 
 ---
 
