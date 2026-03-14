@@ -35,3 +35,14 @@ You can start anywhere.
 - Engineers who want system-level clarity
 - Product Managers working on technical products
 - Architects and builders who want clean mental models
+
+## Docs
+- [Uber: Reduce post-match cancellations (Pickup Quality Pack)](uber-reduce-post-match-cancellations-architecture.md)
+- [Slack: Messaging notification load shaping](slack-messaging-architecture.md)
+- [WhatsApp: How messaging works](whatsapp-how-it-works-architecture.md)
+- [Zomato: Ordering system](zomato-ordering-system-architecture.md)
+- [Skyscanner: System architecture](skyscanner_system_architecture.md)
+- [LinkedIn: Feed notifications](linkedin-feed-notifications-architecture.md)
+- [Instagram: DMs conversation health](instagram-dms-conversation-health-architecture.md)
+- [CRED: Pay UPI architecture](cred-pay-upi-architecture.md)
+- [Lovable: How it works](lovable-how-it-works-architecture.md)
