@@ -106,36 +106,36 @@ Assumed typical stack: **HTTP/gRPC microservices + Kafka + Redis + Postgres/MySQ
 ## 6) System diagram (V1)
 ```mermaid
 flowchart LR
-  Rider[Rider App] -->|booking| Booking[Booking Service]
-  Driver[Driver App] -->|trip screen| Trip[Trip Service]
+  rider["Rider App"] -->|booking| booking["Booking Service"]
+  driver["Driver App"] -->|trip screen| trip["Trip Service"]
 
-  Booking -->|score(pickup)| Scorer[Pickup Difficulty Scorer]
-  Booking -->|lookup(pickup)| POI[POI Template Service]
-  Booking -->|upsert(request_id)| Rendezvous[Rendezvous Service]
-  Booking -->|bucketing| Exp[Experiment/Flags]
+  booking -->|score pickup| scorer["Pickup Difficulty Scorer"]
+  booking -->|lookup pickup| poi["POI Template Service"]
+  booking -->|upsert request_id| rendezvous["Rendezvous Service"]
+  booking -->|bucketing| exp["Experiment / Flags"]
 
-  Dispatch[Dispatch/Matching] -->|TripMatched event| Kafka[(Kafka)]
-  Kafka --> Rendezvous
+  dispatch["Dispatch / Matching"] -->|TripMatched event| kafka[(Kafka)]
+  kafka --> rendezvous
 
-  Trip -->|get pickup pack| Rendezvous
-  Trip -->|get templates| POI
-  Trip -->|optional recompute| Scorer
+  trip -->|get pickup pack| rendezvous
+  trip -->|get templates| poi
+  trip -->|optional recompute| scorer
 
-  Trip -->|banner/push| Comms[Comms/Notifications]
+  trip -->|banner / push| comms["Comms / Notifications"]
 
-  Rider -->|pin edit after match| Trip
+  rider -->|pin edit after match| trip
 
-  Booking -->|events| Kafka
-  Trip -->|events| Kafka
-  Kafka --> Analytics[Analytics/Warehouse]
+  booking -->|events| kafka
+  trip -->|events| kafka
+  kafka --> analytics["Analytics / Warehouse"]
 
-  Rendezvous --> Redis[(Redis cache)]
-  Scorer --> Redis
-  POI --> Redis
+  rendezvous --> redis[(Redis cache)]
+  scorer --> redis
+  poi --> redis
 
-  Rendezvous --> RDB[(Postgres)]
-  POI --> PTDB[(Postgres)]
-  Scorer --> CFG[(Postgres/Config)]
+  rendezvous --> rdb[(Postgres)]
+  poi --> ptdb[(Postgres)]
+  scorer --> cfg[(Postgres / Config)]
 ```
 
 ---
