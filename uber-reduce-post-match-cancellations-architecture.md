@@ -1,8 +1,15 @@
-# Uber Ride-hailing - Reduce Post-Match Cancellations via “Pickup Quality Pack” (System Architecture V1)
+# Uber Ride-hailing - Reduce Post-Match Cancellations via “Pickup Quality Pack” (System Architecture V2)
 
 **Product:** Uber (ride-hailing — Rider + Driver apps)  
 **Audience:** Product Managers / Engineers  
 **Goal:** Describe an implementation-oriented, **generic** (non-proprietary) system architecture to reduce **post‑match cancellations** by improving **pickup rendezvous success** *only when needed*.
+
+**What’s new in V2 (vs V1)**
+- Adds concrete **system decisions** (where strings computed, scoring persistence, ownership boundaries)
+- Hardens **idempotency + consistency model** across request→match→trip
+- More explicit **cache strategy**, **hotspot mitigation**, and **Kafka partitioning**
+- Defines a minimal **POI template ops workflow** (versioning + rollout)
+- Adds **data retention/privacy** notes and production-grade **SLO dashboards**
 
 **Scope in this doc**
 - Eligibility + pickup difficulty scoring (rules-first v0)
@@ -33,17 +40,19 @@ The architecture goal is simple:
 
 ---
 
-## 2) Design principles (V1)
+## 2) Design principles (V2)
 1. **Targeted friction only**: show extra steps only to high-confidence “hard pickup” rides.
 2. **Fail open**: any dependency failure must fall back to baseline UX (never block booking).
 3. **Explainable prompts**: “Hard pickup” must have a human-readable reason.
 4. **Symmetry**: both rider and driver see the same rendezvous string (“where to meet”).
 5. **Idempotent + event-driven**: at-least-once processing with idempotent writes.
+6. **Single writer for shared state**: one service owns the canonical rendezvous payload.
+7. **Cache is an optimization**: caches must be safe to bypass, with correctness preserved.
 
 ---
 
 ## 3) Non-functional requirements (NFRs)
-These are target SLOs for a large ride-hailing marketplace.
+Indicative targets for a large ride-hailing marketplace.
 
 ### Latency budgets
 **Booking-time (pre-request) add-on**
@@ -55,7 +64,7 @@ These are target SLOs for a large ride-hailing marketplace.
 
 ### Availability / degraded modes
 - Pickup Quality Pack availability target: **99.9%** (degraded mode allowed).
-- Degraded mode must preserve core ride request + trip state machine.
+- Degraded mode must preserve core ride request + dispatch + trip state machine.
 
 ### Safety / privacy
 - No prompts that encourage oversharing (phone number, precise outfit, etc.).
@@ -64,6 +73,7 @@ These are target SLOs for a large ride-hailing marketplace.
 ---
 
 ## 4) User-facing modules (what backend must support)
+
 ### Module A — Rider Guided Pickup Confirmation (contextual)
 - Entrance/gate selection (only where POI templates support it)
 - Optional safe quick-note templates (3–5 max)
@@ -88,7 +98,7 @@ Assumed typical stack: **HTTP/gRPC microservices + Kafka + Redis + Postgres/MySQ
 1. **Booking Service (Ride Request API)**
 2. **Pickup Difficulty Scorer Service (rules-first v0)**
 3. **POI Template Service**
-4. **Rendezvous Service (state store)**
+4. **Rendezvous Service (state store + renderer)**
 5. **Dispatch/Matching Service**
 6. **Trip Service (trip state machine)**
 7. **Comms/Notifications Service** (in-app banners / push)
@@ -103,7 +113,7 @@ Assumed typical stack: **HTTP/gRPC microservices + Kafka + Redis + Postgres/MySQ
 
 ---
 
-## 6) System diagram (V1)
+## 6) System diagram (V2)
 ```mermaid
 flowchart LR
   rider["Rider App"] -->|booking| booking["Booking Service"]
@@ -152,16 +162,16 @@ flowchart LR
 3. Booking Service asks Experiment Service for bucket assignment (eligible-only A/B).
 4. If in treatment and eligible:
    - send guided pickup payload to Rider app
-   - Rider completes or skips
+   - rider completes or skips
    - Booking Service writes rendezvous state (best-effort)
 
 **Fail-open logic (mandatory)**
 - If scorer/template slow or fails → treat as **not eligible**, show baseline flow.
-- If rendezvous store write fails → proceed; baseline pickup string used later.
+- If rendezvous write fails → proceed; baseline pickup string used later.
 
 ### 7.2 Match binding (request_id → trip_id)
 1. Dispatch creates a match.
-2. Dispatch emits `TripMatched {request_id, trip_id, driver_id, rider_id}` to Kafka.
+2. Dispatch emits `TripMatched` to Kafka.
 3. Rendezvous Service consumes and binds state:
    - `bind(request_id, trip_id)` idempotently
    - warms Redis
@@ -181,20 +191,52 @@ Pickup Quality Pack adds *soft* substates/flags:
 - `rider_confirmed_coming_out`
 - `driver_confirmed_at_spot`
 
-These should not block trip start; they’re coordination signals.
+These must not block trip start; they’re coordination signals.
 
 ### 7.5 Rider updates pickup after match
 1. Rider edits pickup pin.
-2. Trip Service updates pickup location and emits `PickupUpdated`.
-3. Optionally recompute difficulty + regenerate rendezvous string.
+2. Trip Service updates pickup and emits `PickupUpdated`.
+3. Rendezvous Service (or Trip Service) updates rendezvous payload and revision.
 4. Notify driver via banner (rate-limited).
 
 ---
 
-## 8) Data model (V1)
+## 8) Key system decisions (V2)
 
-### 8.1 PickupDifficultyResult
-Stored for audit + consistency between booking and trip.
+### Decision A — Compute `where_to_meet_string` on the server
+**Choice:** The Rendezvous Service computes and stores a localized `where_to_meet_string`.
+
+**Why**
+- Guarantees rider + driver parity across platforms
+- Simplifies client logic and reduces localization drift
+- Enables fast rendering from cache
+
+**Fallback**
+- If localization fails, store an English (or geo-default) string and keep normalized fields for future re-render.
+
+### Decision B — Persist scoring results at request time
+**Choice:** Store `PickupDifficultyResult` keyed by `request_id` at booking time.
+
+**Why**
+- Stable explainability (“why did you show the prompt?”)
+- Prevents inconsistencies between booking vs trip screens
+- Supports offline backtests and audits
+
+**Fallback**
+- If persist fails, proceed; Trip Service may recompute post-match (best-effort).
+
+### Decision C — Rendezvous Service is the single writer for rendezvous payload
+**Choice:** Only Rendezvous Service mutates `RendezvousState` and manages `revision`.
+
+**Why**
+- Prevents lost updates (booking writes + post-match pin edits)
+- Makes idempotency enforceable in one place
+
+---
+
+## 9) Data model (V2)
+
+### 9.1 PickupDifficultyResult
 - `request_id` (PK)
 - `geo_id`
 - `pickup_lat`, `pickup_lng`
@@ -205,7 +247,7 @@ Stored for audit + consistency between booking and trip.
 - `latency_ms`
 - `created_at`
 
-### 8.2 RendezvousState
+### 9.2 RendezvousState
 - `request_id` (PK)
 - `trip_id` (nullable until match)
 - `selected_entrance_id` / `selected_entrance_label`
@@ -217,7 +259,10 @@ Stored for audit + consistency between booking and trip.
 - `updated_by` (rider|system)
 - `updated_at`
 
-### 8.3 POITemplate (simplified)
+**Concurrency control**
+- Use optimistic concurrency: client sends `revision`; server rejects stale writes with `409 Conflict` and returns the latest state.
+
+### 9.3 POITemplate (simplified)
 - `poi_id` / `geofence_id`
 - `geo_id`
 - `poi_type`
@@ -227,10 +272,10 @@ Stored for audit + consistency between booking and trip.
 
 ---
 
-## 9) APIs (suggested V1 contracts)
-These are intentionally minimal and idempotent.
+## 10) APIs (suggested V2 contracts)
+These are intentionally minimal, cache-friendly, and idempotent.
 
-### 9.1 Difficulty scoring
+### 10.1 Difficulty scoring
 `POST /pickup-difficulty/score`
 ```json
 {
@@ -241,91 +286,46 @@ These are intentionally minimal and idempotent.
   "rider_context": {"tenure": "new", "local_time_bucket": "night"}
 }
 ```
-Response:
-```json
-{
-  "difficulty_score": 0.82,
-  "difficulty_bucket": "hard",
-  "reason_codes": ["MULTI_ENTRANCE_POI", "HISTORICAL_HIGH_FRICTION"],
-  "rules_version": "v0.3",
-  "latency_ms": 143
-}
-```
 
-### 9.2 POI template lookup
+### 10.2 POI template lookup
 `GET /poi-templates/lookup?lat=..&lng=..&geo_id=..`
-Response:
-```json
-{
-  "poi_type": "MALL",
-  "template_version": "2026-03",
-  "entrances": [{"id": "N_GATE", "label": "North Gate"}],
-  "supported": true
-}
-```
 
-### 9.3 Rendezvous state write (best-effort)
+### 10.3 Rendezvous state write (best-effort)
 `PUT /rendezvous/state/{request_id}`
-```json
-{
-  "selected_entrance_id": "N_GATE",
-  "note_template_id": "NEAR_SECURITY_CABIN",
-  "locale": "en-IN",
-  "revision": 3
-}
-```
-Response:
-```json
-{
-  "ok": true,
-  "revision": 4,
-  "where_to_meet_string": "North Gate, near the security cabin"
-}
-```
+- Must be idempotent per `(request_id, revision)`.
 
-### 9.4 Bind request to trip
+### 10.4 Bind request to trip
 `POST /rendezvous/bind`
-```json
-{ "request_id": "...", "trip_id": "..." }
-```
+- Idempotent per `(request_id, trip_id)`.
 
-### 9.5 Pickup pack aggregation
+### 10.5 Pickup pack aggregation
 `GET /trips/{trip_id}/pickup-pack`
-Response:
-```json
-{
-  "difficulty_bucket": "hard",
-  "reason_codes": ["MULTI_ENTRANCE_POI"],
-  "where_to_meet_string": "North Gate",
-  "templates": [{"id": "WAITING_AT_SPOT", "text": "I’m waiting at North Gate."}],
-  "exposure_flags": {"A": true, "B": true, "C": true}
-}
-```
+- Cacheable for short TTL (e.g., 5–15s) with fast invalidation on revision changes.
 
-### 9.6 Pickup confirmations (soft signals)
+### 10.6 Pickup confirmations
 `POST /trips/{trip_id}/pickup-confirmation`
-```json
-{ "side": "rider", "type": "COMING_OUT_NOW" }
-```
+- Soft signals; must not block trip progression.
 
 ---
 
-## 10) Event schemas (Kafka / analytics)
+## 11) Events + partitioning (Kafka)
 Key rule: **at-least-once** delivery; consumers must be idempotent.
 
-### 10.1 Trip matched
+### Recommended partition keys
+- `TripMatched`, `PickupUpdated`, `PostMatchCancel`: partition by `trip_id` for per-trip ordering.
+- Booking-time events (`pickup_difficulty_scored`, `guided_pickup_*`): partition by `request_id`.
+
+### Minimal schemas
 `TripMatched`
 ```json
 { "request_id": "...", "trip_id": "...", "geo_id": "...", "ts": 0 }
 ```
 
-### 10.2 Pickup updated (post-match)
 `PickupUpdated`
 ```json
 { "trip_id": "...", "old_pickup": {"lat": 0, "lng": 0}, "new_pickup": {"lat": 0, "lng": 0}, "revision": 5 }
 ```
 
-### 10.3 Post-match cancel attribution
 `PostMatchCancel`
 ```json
 {
@@ -338,33 +338,57 @@ Key rule: **at-least-once** delivery; consumers must be idempotent.
 }
 ```
 
----
-
-## 11) Scaling & partitioning (practical)
-
-### Where load concentrates
-- Booking-time scoring calls (high QPS, latency sensitive)
-- Post-match trip screen fetches (cacheable, bursty)
-- Hot POIs (airports/malls) create localized hotspots
-
-### Recommended tactics
-- **Redis caches** for POI template lookup + rendezvous reads
-- Partition Kafka topics by `geo_id` or `trip_id` to reduce cross-shard joins
-- Store scorer features as aggregated counters per `(geo_id, pickup_cell_id, poi_id)`
+**Schema management**
+- Prefer a schema registry (Avro/Protobuf/JSON schema) with backward-compatible evolution rules.
 
 ---
 
-## 12) Degraded modes / load shedding
+## 12) Cache strategy (Redis) + hotspot mitigation
+
+### What to cache
+- POI template lookups by `(geo_id, poi_id)` and `(geo_id, pickup_cell_id)`
+- RendezvousState reads by `trip_id` (and request_id pre-match)
+- Scorer friction features by `(geo_id, pickup_cell_id)`
+
+### TTL guidance
+- POI templates: long TTL (hours) with versioned keys
+- RendezvousState: short TTL (seconds to minutes) with revision-aware invalidation
+- Scorer features: medium TTL (minutes)
+
+### Hot POIs
+- Use pre-warmed caches for top POIs in a geo
+- Avoid fanout storms by rate-limiting “pickup updated” banners and coalescing updates
+
+---
+
+## 13) Consistency, idempotency, and retries
+
+### Idempotency keys
+- Booking writes: `(request_id, revision)`
+- Bind: `(request_id, trip_id)`
+- Confirmations: `(trip_id, side, type, client_ts_bucket)`
+
+### Retry policy
+- Client retries are allowed for 5xx/timeouts with exponential backoff.
+- All writes must be safe under retry (idempotent).
+
+### Exactly-once expectations
+- Do not attempt global exactly-once. Use at-least-once events + idempotent consumers.
+
+---
+
+## 14) Degraded modes / load shedding
 This is where reliability is won.
 
 1. **Scorer timeout** → skip Module A entirely (baseline booking).
 2. **POI template missing** → allow only generic note templates.
 3. **Rendezvous store down** → show baseline pickup pin; suppress driver cue reason text if needed.
 4. **Comms rate limiting** → coalesce pickup updates; max 1 banner / N minutes.
+5. **Kafka lag** (non-critical topics) → drop to analytics-only mode; never block core trip flows.
 
 ---
 
-## 13) Experimentation & rollout (V1)
+## 15) Experimentation & rollout (V2)
 - Experiments are **eligible-only A/B**.
 - Ramp: **1% → 5% → 25% → 50%** of eligible rides per geo.
 
@@ -374,19 +398,34 @@ This is where reliability is won.
 - pickup-related support contact spike
 - safety incident uptick correlated with treatment
 
+**Required segmentation**
+- Geo, time-of-day, POI type, rider tenure
+- Difficulty bucket (easy/medium/hard) and reason codes
+
 ---
 
-## 14) Security, privacy, and abuse considerations
+## 16) POI template ops workflow (minimal)
+A simple pipeline to avoid shipping bad pickup guidance.
+
+1. **Authoring**: ops/content tool writes templates (entrances, labels, meeting strings) with locale coverage.
+2. **Validation**: automated checks (missing locales, unsafe copy, duplicate entrances, geo mismatch).
+3. **Versioning**: publish `template_version` per POI/geo.
+4. **Rollout**: allowlist templates by geo + experiment flag; monitor cancels + support spikes.
+5. **Rollback**: revert to previous version instantly (config-based).
+
+---
+
+## 17) Security, privacy, and abuse considerations
 - Sanitize rider notes (length caps, profanity filters, PII detection as needed).
 - Don’t encourage sharing phone numbers or exact outfit.
 - Avoid precise driver location disclosure beyond what baseline already provides.
+- Ensure all logs/events redact user-entered free text by default.
 
 ---
 
-## 15) Open questions (for V2)
-- Where to compute `where_to_meet_string`: server vs client rendering?
-- Should scoring results be persisted at request time or recomputed on match?
-- How to maintain a high-quality curated POI template set (ops workflow + versioning)?
+## 18) Data retention
+- RendezvousState: retain only as long as needed for disputes/ops analytics (e.g., 30–90 days), then delete/aggregate.
+- Analytics events: keep per company policy; prefer aggregated metrics for long-term.
 
 ---
 
