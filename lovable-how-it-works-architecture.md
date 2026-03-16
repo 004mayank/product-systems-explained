@@ -2,15 +2,17 @@
   <img src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/Lovable.png" alt="Lovable logo" width="200" />
 </p>
 
-# How Lovable Works — AI App Generation Architecture (V1)
+# How Lovable Works - AI App Generation Architecture 
 
 **Product:** Lovable  
 **Audience:** Product Managers / Builders / AI-curious users  
-**Goal:** Explain how Lovable turns prompts into working apps, where uncertainty enters the system, and how iteration drives value — without going deep into infra jargon.
+**Goal:** Explain how Lovable turns prompts into working apps, where uncertainty enters the system, and how iteration drives value - without going deep into infra jargon.
+
+**PRD:** https://github.com/004mayank/product-prd/blob/main/lovable-prd-improve-iteration-trust-prd.md
 
 ---
 
-## TL;DR (mental model)
+## Mental model
 Lovable is best understood as a **planning + generation + run/preview + feedback** loop, with two “truths” that must stay aligned:
 1) **What the user thinks the app is** (intent + requirements)  
 2) **What the app actually is** (project state: code, components, data schema, config)
@@ -125,7 +127,7 @@ The generation engine produces (typically in one combined pass):
 - Identical prompts ≠ identical outputs
 - “Failure” can be subjective (works, but not as intended)
 
-This is not a bug — it’s inherent.
+This is not a bug - it’s inherent.
 
 ---
 
@@ -214,7 +216,7 @@ From a PM lens, unreliability often comes from invisible system behavior:
 - weak “change boundaries” (patch vs rewrite)
 - lack of visible system constraints (“what is fixed vs negotiable”)
 
-The system may be working — but users lack a mental model for it.
+The system may be working - but users lack a mental model for it.
 
 ---
 
