@@ -1,22 +1,23 @@
-# System Architecture: CRED Pay (UPI) — Offline Trust Pack
+<p align="center">
+  <img 
+    src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/Cred.png" 
+    alt="Uber Logo" 
+    width="200"
+  />
+</p>
+
+# System Architecture: CRED Pay (UPI) - Offline Trust Pack
 
 **Product:** CRED Pay (UPI)  
 **Author:** Mayank Malviya  
 **Date:** 19 Feb 2026  
-**Status:** v3 (architecture V1→V3 in one doc)
+**Status:** Final 
 
-**PRD (v3):** https://github.com/004mayank/product-prd/blob/main/cred-pay-upi-prd.md
-
----
-
-## Version history
-- **v1 (this doc):** Baseline architecture: components, core flows, data model, state machine.
-- **v2 (this doc):** Deep dive on pending resolution, retry guardrails, receipt caching, observability.
-- **v3 (this doc):** Hardening: idempotency, monotonic-state guarantees, failure handling, launch gates, runbooks.
+**PRD:** https://github.com/004mayank/product-prd/blob/main/cred-pay-upi-prd.md
 
 ---
 
-## 0. Scope & design goals
+## Scope & design goals
 ### In-scope
 - Offline **scan & pay** (static + dynamic QR) for UPI payments.
 - User-facing states: `processing`, `pending`, `success`, `failed`, `reversed`.
