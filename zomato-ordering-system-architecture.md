@@ -2,7 +2,7 @@
   <img src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/zomato-logo.png" alt="Zomato logo" width="200" />
 </p>
 
-# How Zomato Works - Ordering System Architecture (PM View) (V2)
+# How Zomato Works - Ordering System Architecture 
 
 **Product:** Zomato  
 **Audience:** Product Managers / Developers / Foodies  
