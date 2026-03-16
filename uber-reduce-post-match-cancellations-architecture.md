@@ -1,8 +1,15 @@
-# Uber Ride-hailing - Reduce Post-Match Cancellations via “Pickup Quality Pack” (System Architecture V2)
+# Uber Ride-hailing - Reduce Post-Match Cancellations via “Pickup Quality Pack” (System Architecture V3)
 
 **Product:** Uber (ride-hailing — Rider + Driver apps)  
 **Audience:** Product Managers / Engineers  
 **Goal:** Describe an implementation-oriented, **generic** (non-proprietary) system architecture to reduce **post‑match cancellations** by improving **pickup rendezvous success** *only when needed*.
+
+**What’s new in V3 (vs V2)**
+- Upgrades scoring from rules-only to **hybrid rules + ML** (with explainability + fallbacks)
+- Adds a **feature store + training pipeline** and closes the loop with cancellation/arrival labels
+- Introduces a controlled **“Best Stop / Best Entrance”** option for select POIs (guardrailed)
+- Adds **control plane** concepts: policy configs, per-geo rollouts, kill switches, audit trails
+- Expands **observability**: decision logs, counterfactual metrics, and model health dashboards
 
 **What’s new in V2 (vs V1)**
 - Adds concrete **system decisions** (where strings computed, scoring persistence, ownership boundaries)
@@ -12,7 +19,7 @@
 - Adds **data retention/privacy** notes and production-grade **SLO dashboards**
 
 **Scope in this doc**
-- Eligibility + pickup difficulty scoring (rules-first v0)
+- Eligibility + pickup difficulty scoring (hybrid rules + ML)
 - Contextual rider guided pickup confirmation (Module A)
 - Driver “difficulty cue” + message templates (Module B)
 - Arrival window state machine + symmetric rendezvous cues (Module C)
@@ -113,7 +120,7 @@ Assumed typical stack: **HTTP/gRPC microservices + Kafka + Redis + Postgres/MySQ
 
 ---
 
-## 6) System diagram (V2)
+## 6) System diagram (V3)
 ```mermaid
 flowchart LR
   rider["Rider App"] -->|booking| booking["Booking Service"]
@@ -139,13 +146,18 @@ flowchart LR
   trip -->|events| kafka
   kafka --> analytics["Analytics / Warehouse"]
 
-  rendezvous --> redis[(Redis cache)]
-  scorer --> redis
+  scorer --> redis[(Redis cache)]
   poi --> redis
+  rendezvous --> redis
 
   rendezvous --> rdb[(Postgres)]
   poi --> ptdb[(Postgres)]
   scorer --> cfg[(Postgres / Config)]
+
+  analytics --> features["Feature Store"]
+  features --> trainer["Model Training Pipeline"]
+  trainer --> registry["Model Registry"]
+  registry --> scorer
 ```
 
 ---
@@ -234,9 +246,50 @@ These must not block trip start; they’re coordination signals.
 
 ---
 
-## 9) Data model (V2)
+## 9) V3 additions (ML scoring + best-stop + control plane)
 
-### 9.1 PickupDifficultyResult
+### 9.1 Hybrid rules + ML scoring (explainable)
+In V3, the scorer becomes a **hybrid**:
+- **Rules layer (hard gates):** safety constraints, compliance constraints, and “never do harm” cases.
+- **ML layer (ranking + probability):** predicts pickup friction / cancel risk and recommends the right module intensity.
+
+**Outputs (online)**
+- `cancel_risk_post_match` (0..1)
+- `pickup_friction_risk` (0..1)
+- `recommended_pack_level` (0..3)
+- `top_reason_codes[]` (mapped from model features via reason mapping)
+
+**Fail-safe**
+- If the model is unavailable/expired or feature fetch fails → fall back to rules-only scoring (V2 behavior).
+
+### 9.2 Best Stop / Best Entrance (guardrailed, opt-in)
+For select POIs where entrances are well-modeled (airports/malls/campuses), the system can return:
+- `suggested_meet_spot` with coordinates + a human-readable label
+- `confidence` and `constraints` (e.g., “no-stopping zones”, “gates closed at night”)
+
+This must be:
+- **geo-allowlisted**
+- behind a **kill switch**
+- measurable with **safety + legality** review for every template category
+
+### 9.3 Control plane (configs + audit)
+Introduce a small policy/config layer (can be a config service or DB-backed):
+- per-geo thresholds, allowlists, and module toggles
+- model version pinning per geo
+- kill switches for each module and for best-stop
+- audit logs of changes + who approved them
+
+### 9.4 Observability for decisions + models
+Add three dedicated dashboards:
+- **Decision funnel:** eligible → treated → completed Module A → matched → arrived → started → cancelled
+- **Reason-code health:** distribution drift and “unknown reason” rates
+- **Model health:** feature availability, latency, calibration (Brier), and offline-vs-online parity
+
+---
+
+## 10) Data model (V3)
+
+### 10.1 PickupDifficultyResult
 - `request_id` (PK)
 - `geo_id`
 - `pickup_lat`, `pickup_lng`
@@ -247,7 +300,7 @@ These must not block trip start; they’re coordination signals.
 - `latency_ms`
 - `created_at`
 
-### 9.2 RendezvousState
+### 10.2 RendezvousState
 - `request_id` (PK)
 - `trip_id` (nullable until match)
 - `selected_entrance_id` / `selected_entrance_label`
@@ -262,7 +315,7 @@ These must not block trip start; they’re coordination signals.
 **Concurrency control**
 - Use optimistic concurrency: client sends `revision`; server rejects stale writes with `409 Conflict` and returns the latest state.
 
-### 9.3 POITemplate (simplified)
+### 10.3 POITemplate (simplified)
 - `poi_id` / `geofence_id`
 - `geo_id`
 - `poi_type`
@@ -272,10 +325,10 @@ These must not block trip start; they’re coordination signals.
 
 ---
 
-## 10) APIs (suggested V2 contracts)
+## 11) APIs (suggested V3 contracts)
 These are intentionally minimal, cache-friendly, and idempotent.
 
-### 10.1 Difficulty scoring
+### 11.1 Difficulty scoring
 `POST /pickup-difficulty/score`
 ```json
 {
@@ -287,28 +340,28 @@ These are intentionally minimal, cache-friendly, and idempotent.
 }
 ```
 
-### 10.2 POI template lookup
+### 11.2 POI template lookup
 `GET /poi-templates/lookup?lat=..&lng=..&geo_id=..`
 
-### 10.3 Rendezvous state write (best-effort)
+### 11.3 Rendezvous state write (best-effort)
 `PUT /rendezvous/state/{request_id}`
 - Must be idempotent per `(request_id, revision)`.
 
-### 10.4 Bind request to trip
+### 11.4 Bind request to trip
 `POST /rendezvous/bind`
 - Idempotent per `(request_id, trip_id)`.
 
-### 10.5 Pickup pack aggregation
+### 11.5 Pickup pack aggregation
 `GET /trips/{trip_id}/pickup-pack`
 - Cacheable for short TTL (e.g., 5–15s) with fast invalidation on revision changes.
 
-### 10.6 Pickup confirmations
+### 11.6 Pickup confirmations
 `POST /trips/{trip_id}/pickup-confirmation`
 - Soft signals; must not block trip progression.
 
 ---
 
-## 11) Events + partitioning (Kafka)
+## 12) Events + partitioning (Kafka)
 Key rule: **at-least-once** delivery; consumers must be idempotent.
 
 ### Recommended partition keys
@@ -343,7 +396,7 @@ Key rule: **at-least-once** delivery; consumers must be idempotent.
 
 ---
 
-## 12) Cache strategy (Redis) + hotspot mitigation
+## 13) Cache strategy (Redis) + hotspot mitigation
 
 ### What to cache
 - POI template lookups by `(geo_id, poi_id)` and `(geo_id, pickup_cell_id)`
@@ -361,7 +414,7 @@ Key rule: **at-least-once** delivery; consumers must be idempotent.
 
 ---
 
-## 13) Consistency, idempotency, and retries
+## 14) Consistency, idempotency, and retries
 
 ### Idempotency keys
 - Booking writes: `(request_id, revision)`
@@ -377,7 +430,7 @@ Key rule: **at-least-once** delivery; consumers must be idempotent.
 
 ---
 
-## 14) Degraded modes / load shedding
+## 15) Degraded modes / load shedding
 This is where reliability is won.
 
 1. **Scorer timeout** → skip Module A entirely (baseline booking).
@@ -388,7 +441,7 @@ This is where reliability is won.
 
 ---
 
-## 15) Experimentation & rollout (V2)
+## 16) Experimentation & rollout (V3)
 - Experiments are **eligible-only A/B**.
 - Ramp: **1% → 5% → 25% → 50%** of eligible rides per geo.
 
@@ -404,7 +457,7 @@ This is where reliability is won.
 
 ---
 
-## 16) POI template ops workflow (minimal)
+## 17) POI template ops workflow (minimal)
 A simple pipeline to avoid shipping bad pickup guidance.
 
 1. **Authoring**: ops/content tool writes templates (entrances, labels, meeting strings) with locale coverage.
@@ -415,7 +468,7 @@ A simple pipeline to avoid shipping bad pickup guidance.
 
 ---
 
-## 17) Security, privacy, and abuse considerations
+## 18) Security, privacy, and abuse considerations
 - Sanitize rider notes (length caps, profanity filters, PII detection as needed).
 - Don’t encourage sharing phone numbers or exact outfit.
 - Avoid precise driver location disclosure beyond what baseline already provides.
@@ -423,7 +476,7 @@ A simple pipeline to avoid shipping bad pickup guidance.
 
 ---
 
-## 18) Data retention
+## 19) Data retention
 - RendezvousState: retain only as long as needed for disputes/ops analytics (e.g., 30–90 days), then delete/aggregate.
 - Analytics events: keep per company policy; prefer aggregated metrics for long-term.
 
