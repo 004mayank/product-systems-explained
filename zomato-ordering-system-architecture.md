@@ -1,175 +1,307 @@
 <p align="center">
-  <img 
-    src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/zomato-logo.png" 
-    alt="Zomato logo" 
-    width="200"
-  />
+  <img src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/zomato-logo.png" alt="Zomato logo" width="200" />
 </p>
 
-# How Zomato Works - Ordering System Architecture (PM View)
-
+# How Zomato Works — Ordering System Architecture (PM View) (V2)
 
 **Product:** Zomato  
 **Audience:** Product Managers / Developers / Foodies  
-**Goal:** Explain how Zomato moves an order from discovery to delivery at scale,
-focusing on product behavior, constraints, and trade-offs.
+**Goal:** Explain how Zomato moves an order from discovery to delivery at scale, focusing on product behavior, constraints, and trade-offs.
 
+**What changed in V2 (vs V1)**
+- Adds GitHub-renderable **Mermaid diagrams**: system diagram, order state machine, and end-to-end sequence.
+- Makes the **coordination contracts** explicit (what each party promises: user, restaurant, rider, platform).
+- Introduces **idempotency + consistency** concepts (double taps, retries, partial failures).
+- Expands **payments/refunds** into a practical lifecycle (auth, capture, reversal).
+- Adds a minimal **data model**, SLOs, and operational failure playbooks.
 
 ---
 
-## 1. The Core Product Problem
-
+## 1) The core product problem
 Zomato must reliably convert *intent* into a *delivered meal* across:
-- Millions of users
-- Thousands of restaurants across cities
-- A volatile delivery supply
-- Real-time payments and ETAs
+- millions of users
+- thousands of restaurants across cities
+- volatile delivery supply
+- real-time payments and ETAs
 
-From a PM lens, success = **order placed → fulfilled → delivered on time** with trust intact.
+From a PM lens, success is:
+> **order placed → accepted → prepared → picked up → delivered (or fast fail + refund)** with trust intact.
+
+The hard part is not “ordering UI”. It is **multi-party coordination under uncertainty**.
 
 ---
 
-## 2. Key Product Requirements 
-
+## 2) Key product requirements
 Zomato optimizes for:
-- **Conversion:** Reduce drop-offs from menu → order
-- **Reliability:** Orders should complete once placed
-- **Speed:** Accurate ETAs, fast confirmation
-- **Coordination:** Restaurant + delivery partner sync
-- **Trust:** Clear pricing, predictable outcomes
+- **Conversion:** reduce drop-offs from menu → checkout → payment
+- **Reliability:** once placed, orders should complete or fail fast (no limbo)
+- **Speed:** accurate ETAs, quick acceptance and assignment
+- **Coordination:** restaurant + delivery partner + customer stay in sync
+- **Trust:** clear pricing, predictable refunds, transparent status
 
 These requirements drive the system design.
 
 ---
 
-## 3. High-Level Ordering Architecture (Conceptual)
+## 3) High-level ordering architecture (conceptual)
 
-**Flow:**
-- User App  
-- Zomato Platform *(Pricing, Orders, Payments)*  
-- Restaurant ↔ Delivery Partner  
+### 3.1 System diagram (GitHub Mermaid)
+```mermaid
+flowchart LR
+  user["User App"] --> edge["CDN and API Gateway"]
+  edge --> bff["Consumer BFF"]
 
-**PM Insight:**  
-Zomato acts as a **coordinator**, not the executor of cooking or delivery.
+  bff --> catalog["Catalog and Menu"]
+  bff --> pricing["Pricing and Offers"]
+  bff --> orders["Orders Service"]
+  bff --> pay["Payments Service"]
+  bff --> eta["ETA Service"]
 
----
+  orders --> rest["Restaurant Partner App or POS"]
+  orders --> dispatch["Dispatch and Rider Assignment"]
+  dispatch --> rider["Delivery Partner App"]
 
-## 4. Ordering Flow - Step by Step
+  orders --> comms["Notifications"]
+  comms --> channels["Push SMS WhatsApp Email"]
 
-### Step 1: Discovery & Menu
-- User browses restaurants and menus
-- Prices, ratings, ETA estimates shown
+  orders --> stream[(Event Stream)]
+  pay --> stream
+  dispatch --> stream
+  stream --> analytics["Analytics and Warehouse"]
 
-**PM takeaway:** Early expectations are set here-errors ripple downstream.
+  orders --> rdb[(Orders DB)]
+  pay --> pdb[(Payments DB)]
+  dispatch --> ddb[(Dispatch DB)]
+```
 
----
-
-### Step 2: Cart & Pricing
-- Items added to cart
-- Platform fees, delivery fees, offers applied
-
-**Key risk:** Late price revelation → checkout abandonment  
-(Directly tied to your teardown + PRD.)
-
----
-
-### Step 3: Order Placement & Payment
-- User confirms order
-- Payment is authorized (not yet settled in all cases)
-
-**PM insight:** This is the *point of no return*-failures here hurt trust most.
+**PM insight:** Zomato is a **coordinator**. Cooking and delivery are external execution systems; the platform’s job is to keep everyone consistent.
 
 ---
 
-### Step 4: Restaurant Acceptance
-- Order sent to restaurant
-- Restaurant accepts or rejects (capacity, stock)
+## 4) The ordering journey (what happens and why it’s hard)
 
-**Failure mode:** Rejection → refund + user disappointment  
-**Design choice:** Fast rejection > delayed cancellation.
+### Step 1: Discovery and menu
+- user browses restaurants and menus
+- sees price, delivery fee, surge, and an ETA estimate
 
----
+**What the system is really doing**
+- geo eligibility checks (serviceable or not)
+- menu availability windows
+- baseline ETA prediction from current supply and kitchen load
 
-### Step 5: Delivery Partner Assignment
-- System finds an available delivery partner
-- ETA recalculated based on distance and load
-
-**Trade-off:** Speed of assignment vs delivery quality.
+**PM takeaway:** expectations are set here; later surprises create churn.
 
 ---
 
-### Step 6: Preparation, Pickup & Delivery
-- Restaurant prepares food
-- Partner picks up and delivers
-- Live tracking + notifications
+### Step 2: Cart and pricing
+- items added to cart
+- taxes, packaging, platform fee, delivery fee, tips, and offers applied
 
-**PM insight:** Transparency reduces anxiety even when delays happen.
+**Key risk:** late price revelation → checkout abandonment.
 
----
-
-## 5. Payments & Refunds (Conceptual)
-
-
-- Payments are often **authorized early**
-- Final settlement depends on order completion
-- Refunds are critical trust moments
+**System constraints**
+- pricing must be deterministic for a short window
+- promos must be consistent across devices and retries
 
 ---
 
-## 6. Failure Scenarios & Handling
+### Step 3: Place order and payment authorization
+- user confirms order
+- payment is **authorized** (or UPI collect initiated), not necessarily captured
 
-### Restaurant Rejects Order
-- Immediate user notification
-- Auto-refund
-- Offer compensation (sometimes)
+**PM insight:** this is the point of no return psychologically. Errors here hurt trust disproportionately.
 
-### Delivery Partner Unavailable
-- Reassignment
-- ETA update
-- Cancellation if SLA breached
-
-### Delays After Acceptance
-- ETA recalculations
-- Proactive notifications
-- Support intervention if needed
-
-**PM insight:** Clear communication often matters more than speed.
+**Idempotency requirement**
+- double-tap “Place order” or payment retries must not create duplicates.
+- API should support an `Idempotency-Key` for `POST /orders` and `POST /payments/authorize`.
 
 ---
 
-## 7. Key Trade-offs Zomato Makes
+### Step 4: Restaurant acceptance (the first external commit)
+- order request sent to restaurant
+- restaurant accepts or rejects (capacity, stock, closing)
 
-| Trade-off | Decision |
-|---------|----------|
-| Speed vs Accuracy (ETA) | Balance |
-| AOV vs Conversion | Conversion-first |
-| Choice vs Overload | Heavy curation |
-| Automation vs Human Ops | Hybrid |
+**Design choice:** fast rejection is better than delayed cancellation.
 
-These explain many UX and policy decisions users notice.
-
----
-
-## 8. Why Zomato Feels “Reliable” (When It Works)
-
-- Clear order states (placed, accepted, picked up)
-- Real-time status updates
-- Fast failure handling with refunds
-- Strong operational playbooks
-
-Reliability is a **system + ops** outcome, not just tech.
+**Common product tactic**
+- acceptance SLA (e.g., 45–90s)
+- auto-cancel + auto-refund if SLA breached
 
 ---
 
-## 9. PM Takeaways
+### Step 5: Rider assignment (balancing speed, cost, and reliability)
+- dispatch selects a delivery partner
+- ETA recalculated based on distance, batching feasibility, and local supply
 
-- Zomato’s hardest problem is **coordination**, not discovery
-- Late surprises cause the biggest trust loss
-- Systems must optimize for *graceful failure*
-- Clear expectations beat aggressive optimization
+**Trade-off:** faster assignment vs better service quality and fewer cancellations.
 
-Understanding this architecture helps PMs:
-- Choose the right metrics
-- Prioritize where to reduce friction
-- Communicate trade-offs clearly to stakeholders
+---
 
+### Step 6: Prep, pickup, and delivery
+- restaurant prepares food
+- rider picks up and delivers
+- live tracking and proactive notifications
+
+**PM insight:** transparency reduces anxiety even when delays happen.
+
+---
+
+## 5) Order state machine (what users experience as “reliability”)
+A strong state model prevents limbo states.
+
+```mermaid
+stateDiagram-v2
+  [*] --> CART
+  CART --> PLACED: placeOrder
+  PLACED --> PAYMENT_AUTHORIZED: payment ok
+  PLACED --> PAYMENT_FAILED: payment fail
+  PAYMENT_FAILED --> CART: retry or change method
+
+  PAYMENT_AUTHORIZED --> SENT_TO_RESTAURANT
+  SENT_TO_RESTAURANT --> ACCEPTED
+  SENT_TO_RESTAURANT --> REJECTED
+  SENT_TO_RESTAURANT --> CANCELLED: accept timeout
+
+  ACCEPTED --> RIDER_ASSIGNED
+  RIDER_ASSIGNED --> PREPARING
+  PREPARING --> PICKED_UP
+  PICKED_UP --> DELIVERED
+
+  ACCEPTED --> CANCELLED: restaurant cancel
+  RIDER_ASSIGNED --> CANCELLED: rider cancel unrecovered
+  PREPARING --> CANCELLED: issue unrecovered
+  PICKED_UP --> CANCELLED: rare dispute flow
+
+  REJECTED --> REFUND_INITIATED
+  CANCELLED --> REFUND_INITIATED
+  REFUND_INITIATED --> REFUNDED
+  DELIVERED --> CAPTURED
+  CAPTURED --> [*]
+  REFUNDED --> [*]
+```
+
+**PM note:** “Accepted” is a contractual moment. Post-accept cancellations are the most painful; the system should bias toward early correctness.
+
+---
+
+## 6) End-to-end sequence (happy path)
+```mermaid
+sequenceDiagram
+  participant u as User App
+  participant o as Orders Service
+  participant p as Payments Service
+  participant r as Restaurant
+  participant d as Dispatch
+  participant dp as Delivery Partner
+
+  u->>o: POST /orders (idempotency key)
+  o->>p: authorize payment
+  p-->>o: auth success
+  o->>r: send order request
+  r-->>o: accept
+  o->>d: request rider assignment
+  d-->>o: rider assigned
+  d->>dp: push job
+  dp-->>d: accept job
+  o-->>u: status updates (accepted, assigned)
+  dp-->>o: picked up
+  dp-->>o: delivered
+  o->>p: capture payment
+  p-->>o: capture success
+  o-->>u: delivered receipt
+```
+
+---
+
+## 7) Payments and refunds (practical lifecycle)
+Payments are trust infrastructure.
+
+### Common lifecycle
+- **Authorize** at place order (hold funds / intent created)
+- **Capture** on delivered (or on pickup in some policies)
+- **Reverse / Refund** on rejection, cancellation, SLA breach, or dispute
+
+### Refund principles (PM view)
+- speed matters more than perfect explanation
+- provide a clear timeline and status
+- avoid “silent partial refunds” without a breakdown
+
+---
+
+## 8) Failure scenarios and handling (playbooks)
+
+### Restaurant rejects order
+**User experience**
+- immediate notification
+- instant reorder suggestions
+- auto-refund
+
+**System behavior**
+- cancel order
+- emit `OrderRejected`
+- initiate `RefundRequested` with idempotency
+
+---
+
+### No rider available
+**User experience**
+- proactive ETA update
+- clear options: wait, switch restaurant, cancel
+
+**System behavior**
+- progressive widening of dispatch radius
+- dynamic batching rules
+- cut losses if SLA breach is likely
+
+---
+
+### Delays after acceptance
+**User experience**
+- updated ETA with reason labels (kitchen delay, traffic)
+- proactive comms
+- support escalation if thresholds breached
+
+**System behavior**
+- continuous ETA recalculation from events
+- guardrails: don’t oscillate ETA every minute; rate-limit updates
+
+---
+
+## 9) Minimal data model (conceptual)
+- `Order(orderId, userId, restaurantId, status, totalAmount, feesBreakdown, createdAt)`
+- `OrderItem(orderId, skuId, name, qty, unitPrice)`
+- `Payment(paymentId, orderId, method, authStatus, captureStatus, providerRef)`
+- `Assignment(orderId, riderId, status, assignedAt, pickupEta, dropEta)`
+- `OrderEvent(orderId, type, at, actor)`
+
+---
+
+## 10) Key trade-offs Zomato makes
+| Trade-off | Typical decision | Why | Risk |
+|---|---|---|---|
+| Speed vs ETA accuracy | balance | conversion + expectation setting | misses reduce trust |
+| AOV vs conversion | conversion-first | more completed orders | lower margin |
+| Choice vs overload | curated listings | faster decision-making | fewer long-tail options |
+| Automation vs human ops | hybrid | resilience in edge cases | ops cost |
+| Fast fail vs rescue | fast fail early | reduces limbo | may feel harsh |
+
+---
+
+## 11) Metrics (what to actually watch)
+**North-star:** completed orders with on-time delivery and low refunds.
+
+Supporting:
+- menu → cart → payment conversion
+- acceptance rate and acceptance latency
+- rider assignment time and rider cancellation rate
+- on-time delivery rate, ETA error distribution
+- refund rate, refund time to completion
+- support contact rate per 1k orders
+
+---
+
+## 12) PM takeaways
+- Zomato’s hardest problem is **coordination under uncertainty**, not discovery.
+- Late surprises (price, availability, ETA) create the biggest trust loss.
+- Reliability comes from **state models + idempotency + fast-fail policies + ops playbooks**.
+- Clear expectations beat aggressive optimization.
