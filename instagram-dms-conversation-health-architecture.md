@@ -1,32 +1,35 @@
-# Instagram DMs — Conversation Health Assist
+<p align="center">
+  <img 
+    src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/Instagram.png" 
+    alt="Instagram Logo" 
+    width="200"
+  />
+</p>
+
+
+# Instagram DMs - Conversation Health Assist
 
 **Subtitle:** Needs Reply • Requests Triage • Open Loops
 
-**Artifact:** System Architecture (V3)
 **Product:** Instagram (DMs)
-**Scope:** Architecture to support PRD v3+ (V3 adds clearer service boundaries, data flows, and diagrams; still policy-safe and lightweight).
-**Author:** Mayank Malviya (with Botty)
-**Status:** V3 — diagrammed architecture + stronger separation of concerns + production hardening.
+**Scope:** Architecture to support PRD - https://github.com/004mayank/product-prd/blob/main/instagram.md
+**Author:** Mayank Malviya
+**Status:** Final
 
 ---
 
-## 0) Executive summary
+## Executive summary
 We’re building three “conversation health” assists for Instagram DMs:
 
-1) **Needs Reply** — per-thread indicator in inbox list for eligible threads.
-2) **Requests triage** — stable signals + one-tap actions + likely-spam bucket in Message Requests.
-3) **Open Loops** — a small module on entry that resurfaces eligible items after time away.
-
-V3 keeps the core V2 design goals and adds:
-- **Clear service boundaries** (Inbox vs CHS vs Requests vs Integrity).
-- **Explicit data-flow contracts** (what is derived vs stored, where computation happens).
-- **Architecture diagrams** (C4-style + sequences) suitable for Instagram engineering reviews.
+1) **Needs Reply** - per-thread indicator in inbox list for eligible threads.
+2) **Requests triage** - stable signals + one-tap actions + likely-spam bucket in Message Requests.
+3) **Open Loops** - a small module on entry that resurfaces eligible items after time away.
 
 ---
 
 ## 1) Principles and constraints
 1. **Policy-safe by construction:** minimize message-content handling; prefer metadata + integrity signals.
-2. **No inbox reordering (V1–V3):** indicators/modules only.
+2. **No inbox reordering (V1–):** indicators/modules only.
 3. **Latency isolation:** inbox must succeed without CHS; **drop-on-timeout**.
 4. **Data minimization:** store only user actions and minimal timestamps; derived attributes are ephemeral.
 5. **Cross-device convergence:** handled state + caps are user-scoped and stored server-side.
@@ -34,7 +37,7 @@ V3 keeps the core V2 design goals and adds:
 
 ---
 
-## 2) Architecture (V3)
+## 2) Architecture
 
 ### 2.1 Logical components
 **Messaging domain (existing)**
@@ -358,7 +361,7 @@ Common fields (recommended): `client_ts_ms`, `app_version`, `os`, `locale`, expe
 | `dm_needs_reply_mark_handled` | `thread_id` | `duration_days`, `source` | User action derived |
 | `dm_open_loops_impression` | `items_count`, `items_types` | `payload_hash`, `entrypoint` | Prefer counts/types over ids |
 | `dm_open_loops_item_click` | `item_type`, `rank` | `thread_id|request_id` (if allowed) | Apply standard retention controls |
-| `dm_open_loops_dismiss` | — | `payload_hash` | No content |
+| `dm_open_loops_dismiss` | - | `payload_hash` | No content |
 | `dm_request_action` | `request_id`, `action` | `signals_shown`, `spam_bucket` | No message text |
 
 Sampling:
@@ -390,7 +393,7 @@ Sampling:
 
 ---
 
-## 12) Implementation plan (V3)
+## 12) Implementation plan ()
 1) Finalize schema/contract review with Integrity + Messaging owners.
 2) Implement CHS with strict timeouts + cache + deterministic caps.
 3) Add idempotency + KV-backed convergence.
@@ -399,7 +402,7 @@ Sampling:
 
 ---
 
-## 13) V4 candidates (explicitly out of scope for V3)
+## 13) V4 candidates (explicitly out of scope for )
 - inbox reordering experiments
 - richer language-aware “question hint” under policy constraints
 - per-user personalization beyond deterministic buckets
