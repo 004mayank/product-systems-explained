@@ -1,16 +1,15 @@
-# Skyscanner — System Architecture (V4)
+<p align="center">
+  <img 
+    src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/Skyscanner.png" 
+    alt="Skyscanner" 
+    width="200"
+  />
+</p>
+
+
+# Skyscanner - System Architecture
 
 *(Flights-first metasearch, with Accounts + Price Alerts; V4 deepens ranking/quality signals, real‑time pricing freshness, and platform reliability/analytics patterns.)*
-
-## 0) What changed vs V3
-
-V4 adds:
-- **Learning-to-rank & personalization**: offline training + online feature serving, guardrails, and explainable “Best” sort
-- **Price freshness at scale**: revalidation tiers, stale/changed handling, and cache invalidation strategy
-- **Unified quality signals**: provider reliability scoring, itinerary/offer confidence, and anti-fraud signals feeding ranking
-- **Experimentation discipline**: metric trees, counterfactual logging, and partner/affiliate-safe attribution
-- **Reliability patterns**: multi-region search orchestration, graceful degradation, and cost-aware autoscaling
-- **Data products**: clickstream contracts, price-history pipelines, and alert trigger correctness guarantees
 
 ---
 
@@ -134,7 +133,7 @@ flowchart LR
 
 ---
 
-## 3) Search lifecycle & API contracts (V4)
+## 3) Search lifecycle & API contracts 
 
 ### 3.1 Canonical request normalization
 Before any provider calls, Orchestrator performs:
@@ -249,7 +248,7 @@ Start with a **core provider set** and expand if:
 
 ---
 
-## 5) Offer quality pipeline (V4)
+## 5) Offer quality pipeline 
 
 ### 5.1 Canonical schemas (contracts)
 Define explicit versions:
@@ -279,7 +278,7 @@ Maintain per-offer signals:
 
 Use these in ranking and revalidation decisions.
 
-### 5.4 Ranking & personalization (V4)
+### 5.4 Ranking & personalization 
 Ranking typically produces multiple “views” (Best/Cheapest/Fastest) while keeping pagination stable.
 
 **Approach**
@@ -365,7 +364,7 @@ Outcomes:
 
 ---
 
-## 7) Price alerts pipeline (V4)
+## 7) Price alerts pipeline 
 
 ### 7.0 Alerts architecture (batch search + price history)
 ```mermaid
