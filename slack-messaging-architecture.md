@@ -9,7 +9,9 @@
 # Slack Messaging - Notification Load Shaping (NYR) System Architecture
 
 **Product:** Slack (messaging + notifications)
+
 **Audience:** Product Managers / Engineers
+
 **Goal:** Describe a plausible, implementation-oriented system architecture for **notification load shaping** and **Not-Yet-Relevant (NYR)**-style ranking, grounded in **publicly observable Slack behavior** and **generic system design patterns** (no proprietary internals).
 
 **Scope in this doc :**
@@ -20,11 +22,6 @@
 - Reliability, privacy/safety, and observability for the above
 - API contracts + event schemas for candidate generation, NYR scoring, delivery, preferences, and feedback
 - **NEW in V3:** scalability sizing assumptions, queue/partitioning design, hotspot mitigation, cache strategy, and degraded-mode/load-shedding policies
-
-**Version history**
-- **V1:** Conceptual decomposition + flows + reliability/privacy/observability
-- **V2:** Adds API/event contract layer, non-functional requirements, and explicit trade-offs/decisions
-- **V3 (current):** Adds sizing + partitioning/ordering semantics, hotspot mitigation, cache strategy, and operational degraded modes
 
 ---
 
