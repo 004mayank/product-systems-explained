@@ -393,16 +393,10 @@ Sampling:
 
 ---
 
-## 12) Implementation plan ()
+## 12) Implementation plan
 1) Finalize schema/contract review with Integrity + Messaging owners.
 2) Implement CHS with strict timeouts + cache + deterministic caps.
 3) Add idempotency + KV-backed convergence.
 4) Add dashboards + guardrails; staged rollout.
 5) Run holdouts for safety/latency regressions.
 
----
-
-## 13) V4 candidates (explicitly out of scope for )
-- inbox reordering experiments
-- richer language-aware “question hint” under policy constraints
-- per-user personalization beyond deterministic buckets
