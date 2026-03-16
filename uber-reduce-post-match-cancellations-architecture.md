@@ -1,22 +1,18 @@
-# Uber Ride-hailing - Reduce Post-Match Cancellations via “Pickup Quality Pack” (System Architecture V3)
+<p align="center">
+  <img 
+    src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/uber.png" 
+    alt="Uber Logo" 
+    width="200"
+  />
+</p>
 
-**Product:** Uber (ride-hailing — Rider + Driver apps)  
+# Uber Ride-hailing - Reduce Post-Match Cancellations via “Pickup Quality Pack”
+
+**Product:** Uber (ride-hailing - Rider + Driver apps)  
 **Audience:** Product Managers / Engineers  
 **Goal:** Describe an implementation-oriented, **generic** (non-proprietary) system architecture to reduce **post‑match cancellations** by improving **pickup rendezvous success** *only when needed*.
 
-**What’s new in V3 (vs V2)**
-- Upgrades scoring from rules-only to **hybrid rules + ML** (with explainability + fallbacks)
-- Adds a **feature store + training pipeline** and closes the loop with cancellation/arrival labels
-- Introduces a controlled **“Best Stop / Best Entrance”** option for select POIs (guardrailed)
-- Adds **control plane** concepts: policy configs, per-geo rollouts, kill switches, audit trails
-- Expands **observability**: decision logs, counterfactual metrics, and model health dashboards
-
-**What’s new in V2 (vs V1)**
-- Adds concrete **system decisions** (where strings computed, scoring persistence, ownership boundaries)
-- Hardens **idempotency + consistency model** across request→match→trip
-- More explicit **cache strategy**, **hotspot mitigation**, and **Kafka partitioning**
-- Defines a minimal **POI template ops workflow** (versioning + rollout)
-- Adds **data retention/privacy** notes and production-grade **SLO dashboards**
+---
 
 **Scope in this doc**
 - Eligibility + pickup difficulty scoring (hybrid rules + ML)
@@ -81,17 +77,17 @@ Indicative targets for a large ride-hailing marketplace.
 
 ## 4) User-facing modules (what backend must support)
 
-### Module A — Rider Guided Pickup Confirmation (contextual)
+### Module A - Rider Guided Pickup Confirmation (contextual)
 - Entrance/gate selection (only where POI templates support it)
 - Optional safe quick-note templates (3–5 max)
 - Always provide a **“Looks good” skip**
 
-### Module B — Driver Difficulty Cue + Templates
+### Module B - Driver Difficulty Cue + Templates
 - “Easy / Medium / Hard” chip + reason
 - 1‑tap message templates that incorporate rider’s entrance/landmark
 - **No ‘best stop’** in MVP by default
 
-### Module C — Pickup State Machine + Rendezvous Cues
+### Module C - Pickup State Machine + Rendezvous Cues
 - Rider: “Driver waiting at {spot}” card + car/plate + “I’m coming out now”
 - Driver: “Waiting at {spot}” card + timer + “I’m at pickup spot”
 - Pickup updates (pin edits) refresh rendezvous string and notify driver (rate-limited)
@@ -120,7 +116,7 @@ Assumed typical stack: **HTTP/gRPC microservices + Kafka + Redis + Postgres/MySQ
 
 ---
 
-## 6) System diagram (V3)
+## 6) System diagram 
 ```mermaid
 flowchart LR
   rider["Rider App"] -->|booking| booking["Booking Service"]
@@ -215,7 +211,7 @@ These must not block trip start; they’re coordination signals.
 
 ## 8) Key system decisions (V2)
 
-### Decision A — Compute `where_to_meet_string` on the server
+### Decision A - Compute `where_to_meet_string` on the server
 **Choice:** The Rendezvous Service computes and stores a localized `where_to_meet_string`.
 
 **Why**
@@ -226,7 +222,7 @@ These must not block trip start; they’re coordination signals.
 **Fallback**
 - If localization fails, store an English (or geo-default) string and keep normalized fields for future re-render.
 
-### Decision B — Persist scoring results at request time
+### Decision B - Persist scoring results at request time
 **Choice:** Store `PickupDifficultyResult` keyed by `request_id` at booking time.
 
 **Why**
@@ -237,7 +233,7 @@ These must not block trip start; they’re coordination signals.
 **Fallback**
 - If persist fails, proceed; Trip Service may recompute post-match (best-effort).
 
-### Decision C — Rendezvous Service is the single writer for rendezvous payload
+### Decision C - Rendezvous Service is the single writer for rendezvous payload
 **Choice:** Only Rendezvous Service mutates `RendezvousState` and manages `revision`.
 
 **Why**
@@ -287,7 +283,7 @@ Add three dedicated dashboards:
 
 ---
 
-## 10) Data model (V3)
+## 10) Data model 
 
 ### 10.1 PickupDifficultyResult
 - `request_id` (PK)
@@ -441,7 +437,7 @@ This is where reliability is won.
 
 ---
 
-## 16) Experimentation & rollout (V3)
+## 16) Experimentation & rollout 
 - Experiments are **eligible-only A/B**.
 - Ramp: **1% → 5% → 25% → 50%** of eligible rides per geo.
 
