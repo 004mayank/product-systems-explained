@@ -135,10 +135,10 @@ Iteration becomes reliable when the system can apply changes as **diffs** agains
 ### 7.1 Patch vs rewrite (why iteration can feel unsafe)
 ```mermaid
 flowchart LR
-  prompt["New prompt"] --> decision{ "Update strategy" }
+  prompt["New prompt"] --> decision{"Update strategy"}
 
-  decision -->|"Patch"| patch["Edit specific files\npreserve rest"]
-  decision -->|"Rewrite"| rewrite["Regenerate large chunks\noverwrite risk"]
+  decision -->|Patch| patch["Edit specific files\npreserve rest"]
+  decision -->|Rewrite| rewrite["Regenerate large chunks\noverwrite risk"]
 
   patch --> stable["Stable iteration\nsmall blast radius"]
   rewrite --> drift["Drift + regressions\nunexpected breakage"]
