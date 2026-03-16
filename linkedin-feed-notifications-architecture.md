@@ -1,12 +1,12 @@
 <p align="center">
   <img 
-    src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/linkedin.png" 
-    alt="LinkedIn logo" 
+    src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/Linkedin.png" 
+    alt="Linkedin Logo" 
     width="200"
   />
 </p>
 
-# LinkedIn Home Feed + Notifications — System Architecture (Plausible)
+# LinkedIn Home Feed + Notifications - System Architecture
 
 **Product:** LinkedIn (Home Feed + Notifications)
 
@@ -14,10 +14,7 @@
 
 **Goal:** Describe a plausible, implementation-oriented architecture for **(a) the LinkedIn Home Feed** and **(b) the notifications system**, grounded in publicly observable product behavior and generic system design patterns (no proprietary internals).
 
-**Version history**
-- **V1:** Conceptual decomposition + end-to-end flows + trade-offs
-- **V2:** Adds explicit **NFRs/SLOs**, **sizing assumptions**, **API/event contracts**, **partitioning/idempotency**, **cache strategy**, and more concrete **degraded-mode** policies.
-- **V3 (this doc):** Tightens the **end-to-end story** with **sequence flows**, adds **hard problems** (privacy changes, deletes, backfills), clarifies **fanout strategies**, and adds **operational playbooks** (budgets, retries, poison pills).
+**PRD:** https://github.com/004mayank/product-prd/blob/main/linkedin-signal-density-prd.md
 
 ---
 
