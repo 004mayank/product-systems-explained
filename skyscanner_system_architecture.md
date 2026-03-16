@@ -11,6 +11,10 @@
 
 *(Flights-first metasearch, with Accounts + Price Alerts; V4 deepens ranking/quality signals, real‑time pricing freshness, and platform reliability/analytics patterns.)*
 
+**Product:** Skyscanner 
+**Audience:** Product Managers / Builders / AI-curious users  
+**PRD:** https://github.com/004mayank/product-prd/blob/main/skyscanner-flight-search-to-booking-prd.md
+
 ---
 
 ## 1) Goals & scope
