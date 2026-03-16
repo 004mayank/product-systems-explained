@@ -2,18 +2,11 @@
   <img src="https://raw.githubusercontent.com/004mayank/product-teardowns/main/images/zomato-logo.png" alt="Zomato logo" width="200" />
 </p>
 
-# How Zomato Works — Ordering System Architecture (PM View) (V2)
+# How Zomato Works - Ordering System Architecture (PM View) (V2)
 
 **Product:** Zomato  
 **Audience:** Product Managers / Developers / Foodies  
 **Goal:** Explain how Zomato moves an order from discovery to delivery at scale, focusing on product behavior, constraints, and trade-offs.
-
-**What changed in V2 (vs V1)**
-- Adds GitHub-renderable **Mermaid diagrams**: system diagram, order state machine, and end-to-end sequence.
-- Makes the **coordination contracts** explicit (what each party promises: user, restaurant, rider, platform).
-- Introduces **idempotency + consistency** concepts (double taps, retries, partial failures).
-- Expands **payments/refunds** into a practical lifecycle (auth, capture, reversal).
-- Adds a minimal **data model**, SLOs, and operational failure playbooks.
 
 ---
 
