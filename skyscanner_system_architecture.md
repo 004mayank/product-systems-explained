@@ -97,6 +97,41 @@ V4 adds:
 - **Warehouse/lake** (BigQuery/Snowflake/S3): analytics + price history
 - Observability: logs/metrics/traces, SLO dashboards
 
+### 2.1 System diagram (GitHub Mermaid)
+```mermaid
+flowchart LR
+  web["Web App"] --> cdn["CDN"]
+  mobile["iOS/Android"] --> cdn
+  cdn --> gw["API Gateway"]
+  gw --> bff["BFF"]
+
+  bff --> id["Identity and Accounts"]
+  bff --> orch["Search Orchestrator"]
+  bff --> alerts["Saved Searches and Alerts"]
+
+  orch --> conn["Provider Connectors"]
+  conn --> prov["Airlines and OTAs"]
+
+  orch --> enrich["Normalize and Enrich"]
+  enrich --> rank["Ranking and Facets"]
+  rank --> redis[(Redis)]
+
+  bff --> redirect["Redirect Service"]
+  redirect --> reval["Revalidation Service"]
+  reval --> prov
+
+  redirect --> track["Tracking and Attribution"]
+  track --> bus[(Event Bus)]
+  bus --> wh["Warehouse"]
+  bus --> feat["Feature Store"]
+
+  alerts --> notify["Notifications"]
+  notify --> ch["Email SMS Push"]
+
+  id --> rdb[(Relational DB)]
+  alerts --> rdb
+```
+
 ---
 
 ## 3) Search lifecycle & API contracts (V4)
@@ -143,6 +178,41 @@ Event types:
 
 Fallback polling:
 `GET /search/{searchId}/results?cursor=...`
+
+### 3.4.1 Search sequence (create → fan-out → stream)
+```mermaid
+sequenceDiagram
+  participant c as Client
+  participant b as BFF
+  participant o as Orchestrator
+  participant k as Connectors
+  participant n as Normalize Enrich
+  participant r as Rank Facets
+
+  c->>b: POST /search
+  b->>o: createSearch(normalized)
+  o-->>b: searchId + streamUrl
+  b-->>c: searchId + streamUrl
+
+  c->>b: GET /search/{id}/stream
+  b->>o: openStream(id)
+
+  par provider fanout
+    o->>k: call provider A
+    o->>k: call provider B
+    o->>k: call provider C
+  end
+
+  k-->>o: raw results batches
+  o->>n: normalize + dedupe inputs
+  n->>r: candidates
+  r-->>o: ranked batches
+  o-->>b: ResultBatch events
+  b-->>c: SSE ResultBatch
+
+  o-->>b: SearchComplete
+  b-->>c: SSE SearchComplete
+```
 
 ### 3.5 Pagination & stability guarantees
 To reduce payload and make cursors stable:
@@ -226,6 +296,21 @@ Ranking typically produces multiple “views” (Best/Cheapest/Fastest) while ke
   - itinerary quality (layovers, airport changes, red-eyes)
   - user context (locale, device, prior behavior) with strict consent
 
+### 5.4.1 LTR pipeline (offline + online)
+```mermaid
+flowchart LR
+  imp["Impressions"] --> log["Clickstream Logging"]
+  log --> cf["Counterfactual Fields\nposition, candidates, policy"]
+  cf --> wh["Warehouse"]
+  wh --> train["Offline Training"]
+  train --> reg["Model Registry"]
+  reg --> serve["Online Scoring"]
+
+  fs["Feature Store"] --> serve
+  serve --> rank["Ranking Service"]
+  rank --> api["Search Response"]
+```
+
 **Guardrails**
 - Never rank “too good to be true” offers above a confidence threshold without revalidation
 - Explainable contributions for “Best” (price + duration + stops + reliability)
@@ -246,8 +331,29 @@ Ranking typically produces multiple “views” (Best/Cheapest/Fastest) while ke
 ### 6.2 Revalidation policy
 Revalidate when:
 - offer near TTL
-- provider has high “change rate”
+- provider has high change rate
 - anomaly score is high
+
+#### 6.2.1 Freshness tiers (cost-aware)
+A practical approach is to apply revalidation selectively:
+- **Tier 0**: no revalidation (trusted providers, long TTL, low change rate)
+- **Tier 1**: lightweight recheck (head call, cached quote, limited fields)
+- **Tier 2**: full revalidation (fresh price + fare rules)
+
+```mermaid
+flowchart LR
+  pick["Selected offer"] --> policy["Revalidation Policy"]
+  policy -->|Tier 0| ok0["Redirect"]
+  policy -->|Tier 1| lite["Light check"]
+  policy -->|Tier 2| full["Full revalidate"]
+
+  lite --> decision{"Valid"}
+  full --> decision
+
+  decision -->|Yes| redirect["Redirect"]
+  decision -->|No changed| changed["Return changed price\nconfirm"]
+  decision -->|No stale| stale["Return alternatives"]
+```
 
 Outcomes:
 - `VALID` → redirect
@@ -260,6 +366,23 @@ Outcomes:
 ---
 
 ## 7) Price alerts pipeline (V4)
+
+### 7.0 Alerts architecture (batch search + price history)
+```mermaid
+flowchart LR
+  user["User"] --> alerts["Alerts Service"]
+  alerts --> sched["Scheduler"]
+  sched --> bsearch["Batch Search Orchestrator"]
+  bsearch --> conn["Provider Connectors"]
+  conn --> prov["Providers"]
+
+  bsearch --> obs["Price Observation Writer"]
+  obs --> wh["Warehouse Price History"]
+
+  obs --> trig["Trigger Evaluator"]
+  trig --> notify["Notifications"]
+  notify --> ch["Email SMS Push"]
+```
 
 ### 7.1 Batch search mode
 Alerts run searches in a **batch mode**:
@@ -303,8 +426,11 @@ Store:
 
 ### 9.1 Caching
 - Redis search state + partial results (TTL minutes)
+  - keys like: `search:{searchId}:meta`, `search:{searchId}:batches`, `search:{searchId}:cursor:{cursor}`
 - reference data (airports/airlines/FX) longer TTL
+  - versioned keys like: `ref:airports:v{n}`, `ref:fx:{base}:{quote}:{day}`
 - provider response caching: very short TTL, provider-specific, respect terms
+  - safest pattern is caching **normalized** provider responses by `(providerId, queryHash, paramsHash)` with TTL seconds
 
 ### 9.2 Data retention (principles)
 - minimize PII in event streams
