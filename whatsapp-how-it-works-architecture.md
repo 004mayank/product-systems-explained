@@ -6,7 +6,7 @@
   />
 </p>
 
-# How WhatsApp Works — Product & System Architecture
+# How WhatsApp Works - Product & System Architecture
 
 **Product:** WhatsApp
 **Audience:** Product Managers / Developers / Curious Minds
@@ -15,12 +15,6 @@
 **Related docs:**
 - Teardown: https://github.com/004mayank/product-teardowns/blob/main/whatsapp-messaging-teardown.md
 - PRD: https://github.com/004mayank/product-prd/blob/main/whatsapp-messaging-prd.md
-
----
-
-## Version history
-- **v2 (current):** added a PM-view system map for the PRD “conversation health” initiatives (TTFR/CCR), including instrumentation, notification decisioning, and rollout/experimentation considerations.
-- **v1:** baseline explanation of WhatsApp messaging architecture, encryption, delivery, and reliability concepts.
 
 ---
 
@@ -76,7 +70,7 @@ Recipient Device (decrypts)
 
 ---
 
-## 4) Message flow — step by step
+## 4) Message flow - step by step
 
 ### Step 1: Message creation
 - User types a message
@@ -245,7 +239,7 @@ To improve **TTFR** and **CCR**, you need consistent definitions and events.
 PM note:
 > The system should make it easy to compute TTFR/CCR by joining “start” and “reply” events per conversation.
 
-### 11.2 “Needs reply” state — where it can live
+### 11.2 “Needs reply” state - where it can live
 There are two reasonable approaches:
 
 **Option A: On-device computation (preferred for simplicity + privacy)**
