@@ -1,4 +1,4 @@
-# Google Search — AI Answers (Grounded) Without Breaking the Web (System Architecture V1)
+# Google Search — AI Answers (Grounded) Without Breaking the Web (System Architecture V2)
 
 **Product:** Google Search (SERP)  
 **Audience:** PMs / Engineers  
@@ -10,7 +10,7 @@
 ---
 
 ## 1) What this system is
-AI Answers is a SERP module that, for eligible queries, produces a **retrieval-grounded** summary with **citations**.
+AI Answers is a SERP module that, for eligible queries, produces a **retrieval-grounded** answer with **citations** and **source-forward UX**.
 
 Hard constraints:
 - Users must finish informational tasks faster (when eligible)
@@ -20,15 +20,24 @@ Hard constraints:
 The core mechanism is a per-query policy decision:
 > **Answer vs Ask vs Route vs Links-only**
 
+V2 adds:
+- claim-level grounding checks (not just section-level)
+- explicit **risk and policy gates** (YMYL, elections, crises)
+- **publisher value guardrails** wired into eligibility and layout
+- caching of **evidence bundles** and **verified answer artifacts**
+- clear separation of **online serving** vs **offline evaluation**
+
 ---
 
-## 2) Design principles (V1)
+## 2) Design principles (V2)
 1. **Conservative by default:** if unsure, fall back to classic results.
 2. **Grounding is mandatory:** generation is constrained to retrieved evidence.
-3. **Citations must be correct:** if citation checks fail, do not ship the answer.
+3. **Citations must be correct:** if verification fails, do not ship the answer.
 4. **Freshness-aware:** breaking / time-sensitive topics prefer sources-first.
 5. **Web value exchange:** source UX is first-class, not decorative.
 6. **Ads integrity:** strict separation between ads and AI output.
+7. **Risk-aware routing:** for sensitive clusters, prefer links, routing, or tightly scoped answers.
+8. **Auditability by construction:** every shipped token is attributable to evidence + policy.
 
 ---
 
@@ -44,55 +53,76 @@ The core mechanism is a per-query policy decision:
 ## 4) High-level components
 ### Online path
 - **SERP Frontend**: renders classic results + modules; progressive AI Answer slot
-- **Query Understanding**: intent, risk, freshness sensitivity, ambiguity
+- **Query Understanding**: ambiguity, entities, language, task type
+- **Risk Classifier**: YMYL + crisis + policy sensitivity scoring
+- **Freshness Detector**: evergreen vs periodic vs breaking; timestamp requirements; “as of” time
+- **Intent Router**: decides if query should route to verticals (News/Maps/Shopping)
 - **Policy Engine**: decides Answer/Ask/Route/Links-only (plus kill switches)
+- **Answer Cache Lookup**: returns recently verified answers when safe
 - **Retrieval Orchestrator**: top documents + passages with diversity constraints
 - **Source Quality Filter**: spam/thin content filtering; diversity enforcement
+- **Evidence Bundle**: normalized retrieved passages with provenance and timestamps
 - **Answer Generator**: grounded synthesis in structured sections
-- **Citation Verifier**: claim/section entailment checks vs cited passages
-- **Freshness Controller**: breaking/periodic detection; timestamp requirements; “as of” time
+- **Claim Extractor**: turns sections into atomic claims for verification
+- **Citation Verifier**: claim-level entailment checks vs cited passages
+- **Verified Answer Cache**: caches only verification-passing artifacts
 
 ### Monitoring + control
-- **Telemetry Pipeline**: decision logs, sources, citations, user actions, outcomes
+- **Telemetry Pipeline**: decisions, sources, citations, user actions, outcomes
 - **Experimentation**: eligibility-only A/B, holdbacks
+- **Offline Evaluation**: continuous evals for citation accuracy and satisfaction
 - **Ecosystem Guardrails**: publisher value scorecard + automatic tightening per query cluster
 
 ### Data systems
 - **Web Index**: documents + ranking signals
 - **Passage Store** (optional): precomputed passages/snippets
-- **Caches**: short TTL for evidence bundles / safe answers
+- **Caches**: short TTL for evidence bundles / verified answers
 - **Decision Log Store**: debug/audit trails
 - **Metrics Warehouse**: aggregated metrics for dashboards + guardrails
 
 ---
 
-## 5) System diagram (V1)
+## 5) System diagram (V2)
 ```mermaid
 flowchart LR
   user["User"] --> serp["SERP Frontend"]
 
   serp --> qu["Query Understanding"]
-  qu --> policy["Policy Engine"]
+  qu --> risk["Risk Classifier"]
+  qu --> fresh["Freshness Detector"]
+  qu --> intent["Intent Router"]
 
-  policy -->|Answer| retrieve["Retrieval Orchestrator"]
+  risk --> policy["Policy Engine"]
+  fresh --> policy
+  intent --> policy
+
+  policy -->|Answer| cacheGet["Answer Cache Lookup"]
+  cacheGet -->|hit| serp
+  cacheGet -->|miss| retrieve["Retrieval Orchestrator"]
+
   policy -->|Ask| serp
   policy -->|Route| serp
   policy -->|Links-only| serp
 
   retrieve --> index["Web Index"]
-  retrieve --> filter["Source Quality Filter"]
-  filter --> gen["Answer Generator"]
-  filter --> fresh["Freshness Controller"]
+  retrieve --> pass["Passage Store"]
+  retrieve --> qfilt["Source Quality Filter"]
+  qfilt --> bundle["Evidence Bundle"]
 
-  gen --> verify["Citation Verifier"]
-  verify -->|pass| serp
+  bundle --> gen["Answer Generator"]
+  gen --> claim["Claim Extractor"]
+  claim --> verify["Citation Verifier"]
+  verify -->|pass| cacheSet["Verified Answer Cache"]
+  cacheSet --> serp
   verify -->|fail| serp
 
-  serp --> logs["Decision Logs"]
+  serp --> logd["Decision Logs"]
+  serp --> loga["Answer Logs"]
   serp --> events["Telemetry Events"]
 
   events --> wh["Metrics Warehouse"]
-  wh --> guard["Ecosystem Guardrails"]
+  wh --> eval["Offline Evaluation"]
+  eval --> guard["Ecosystem Guardrails"]
   guard --> policy
 ```
 
@@ -177,8 +207,53 @@ If the scorecard drops below thresholds, Guardrails triggers:
 
 ---
 
-## 12) What V2 would add (not in scope here)
-- richer claim-level citations everywhere (not just section-level)
-- multi-perspective UX for contested topics
-- publisher controls/visibility tooling
-- more advanced caching strategies for evidence bundles
+## 12) V2 additions (implemented in this doc)
+### 12.1 Claim-level grounding
+V2 treats the answer as a set of atomic **claims** and verifies each claim against citations:
+- extract claims from each answer section
+- require at least one supporting passage per claim
+- block or rewrite claims that fail entailment
+
+### 12.2 Risk-aware and topic-aware routing
+Policy Engine uses risk + freshness + intent to decide among:
+- **Answer**: eligible + verifiable + non-breaking
+- **Ask**: ambiguous queries to disambiguate before retrieving
+- **Route**: specialized verticals (News, Maps, Shopping, Flights)
+- **Links-only**: high-risk, low evidence quality, or guardrails triggered
+
+### 12.3 Evidence bundle caching
+Two caches with different safety properties:
+- **Evidence Bundle Cache** (short TTL): retrieved passages, diversity-constrained
+- **Verified Answer Cache** (short TTL): only answers that passed verification; contains citations + as-of timestamp
+
+### 12.4 Publisher value guardrails wired to serving
+Guardrails is not just a dashboard. It can automatically:
+- reduce eligibility in a query cluster
+- enforce higher domain diversity
+- shift layout to "sources-first" variants
+- increase citation prominence and outbound affordances
+
+### 12.5 Offline evaluation as a first-class system
+A continuous eval pipeline measures:
+- citation accuracy
+- factuality under freshness shifts
+- user satisfaction proxies (reformulations, pogo-sticking)
+- publisher value metrics (qualified outbound)
+
+---
+
+## 13) Multi-perspective and contested topics (optional V2.1)
+For contested topics, the Answer Generator can switch to a **multi-perspective template**:
+- "What sources agree on"
+- "Where sources differ"
+- "How to verify"
+
+This is gated by risk policy and requires stronger diversity + verification thresholds.
+
+## 14) Publisher controls (optional V2.1)
+A publisher-facing control plane can expose:
+- why the site was cited (topic + passage)
+- citation traffic and engagement metrics
+- reporting for citation mismatch
+
+This requires careful abuse prevention and is typically rolled out gradually.
