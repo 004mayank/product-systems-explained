@@ -1,4 +1,4 @@
-# Google Search — AI Answers (Grounded) Without Breaking the Web (System Architecture V2)
+# Google Search — AI Answers (Grounded) Without Breaking the Web (System Architecture V3)
 
 **Product:** Google Search (SERP)  
 **Audience:** PMs / Engineers  
@@ -20,16 +20,16 @@ Hard constraints:
 The core mechanism is a per-query policy decision:
 > **Answer vs Ask vs Route vs Links-only**
 
-V2 adds:
-- claim-level grounding checks (not just section-level)
-- explicit **risk and policy gates** (YMYL, elections, crises)
-- **publisher value guardrails** wired into eligibility and layout
-- caching of **evidence bundles** and **verified answer artifacts**
-- clear separation of **online serving** vs **offline evaluation**
+V3 adds:
+- **model governance**: model registry, prompt versioning, controlled rollouts
+- **abuse and integrity**: injection resistance, spam adversaries, coordinated manipulation detection
+- **privacy**: query logging minimization, retention policy hooks, PII-aware controls
+- **evaluation and incident response**: golden sets, canary queries, rollback playbooks
+- all V2 additions: claim-level grounding, risk gates, publisher guardrails, caching, offline eval
 
 ---
 
-## 2) Design principles (V2)
+## 2) Design principles (V3)
 1. **Conservative by default:** if unsure, fall back to classic results.
 2. **Grounding is mandatory:** generation is constrained to retrieved evidence.
 3. **Citations must be correct:** if verification fails, do not ship the answer.
@@ -38,6 +38,8 @@ V2 adds:
 6. **Ads integrity:** strict separation between ads and AI output.
 7. **Risk-aware routing:** for sensitive clusters, prefer links, routing, or tightly scoped answers.
 8. **Auditability by construction:** every shipped token is attributable to evidence + policy.
+9. **Govern like a production system:** versioned prompts, explicit model registry, safe rollout.
+10. **Assume adversaries:** prompt injection, SEO spam, coordinated manipulation, and gaming attempts.
 
 ---
 
@@ -71,6 +73,9 @@ V2 adds:
 - **Telemetry Pipeline**: decisions, sources, citations, user actions, outcomes
 - **Experimentation**: eligibility-only A/B, holdbacks
 - **Offline Evaluation**: continuous evals for citation accuracy and satisfaction
+- **Model Registry**: approved model versions per stage (classify, generate, verify)
+- **Prompt and Policy Config**: versioned templates and thresholds, remotely switchable
+- **Incident Response Console**: rollbacks, kill switches, audit drilldowns
 - **Ecosystem Guardrails**: publisher value scorecard + automatic tightening per query cluster
 
 ### Data systems
@@ -82,7 +87,7 @@ V2 adds:
 
 ---
 
-## 5) System diagram (V2)
+## 5) System diagram (V3)
 ```mermaid
 flowchart LR
   user["User"] --> serp["SERP Frontend"]
@@ -92,7 +97,11 @@ flowchart LR
   qu --> fresh["Freshness Detector"]
   qu --> intent["Intent Router"]
 
-  risk --> policy["Policy Engine"]
+  cfg["Prompt and Policy Config"] --> policy["Policy Engine"]
+  registry["Model Registry"] --> gen
+  registry --> verify
+
+  risk --> policy
   fresh --> policy
   intent --> policy
 
@@ -124,6 +133,9 @@ flowchart LR
   wh --> eval["Offline Evaluation"]
   eval --> guard["Ecosystem Guardrails"]
   guard --> policy
+
+  events --> ir["Incident Response Console"]
+  ir --> policy
 ```
 
 ---
@@ -257,3 +269,60 @@ A publisher-facing control plane can expose:
 - reporting for citation mismatch
 
 This requires careful abuse prevention and is typically rolled out gradually.
+
+## 15) Model governance and rollout safety (V3)
+### 15.1 Model registry
+Treat every model as a production dependency:
+- registry stores: `model_id`, `purpose`, `owner`, `risk_tier`, `approved_regions`, `expiry`
+- serving stages reference **registry aliases** (ex: `answer_gen_default`) rather than hard-coded versions
+
+### 15.2 Prompt and policy versioning
+- prompts are versioned artifacts (like code)
+- policy thresholds are versioned and can be rolled back independently
+- every decision/answer log includes `prompt_version` and `policy_version`
+
+### 15.3 Canary queries and blast-radius control
+- canary sets: high-risk + high-traffic + edge cases
+- staged rollout: employees → small geo → broad
+- instant rollback paths:
+  - `Answer` -> `Links-only` at policy layer
+  - model rollback via registry alias
+
+---
+
+## 16) Abuse, manipulation, and injection resistance (V3)
+### 16.1 Prompt injection and untrusted text
+Assume retrieved pages may contain instructions for the model.
+Mitigations:
+- system prompt explicitly treats retrieved passages as **untrusted**
+- strip or downweight boilerplate and nav text
+- verifier checks for "instruction leakage" patterns
+
+### 16.2 Coordinated manipulation
+Signals can feed Risk Classifier and Guardrails:
+- sudden domain spikes per cluster
+- highly similar content across domains
+- query chains indicating gaming
+
+---
+
+## 17) Privacy and data retention hooks (V3)
+- minimize raw query retention in logs; prefer hashed identifiers and aggregated metrics
+- PII detection can force `Links-only` or redact answer sections
+- retention tiers:
+  - short-lived debug logs for incident response
+  - long-lived aggregates for guardrails and evaluation
+
+---
+
+## 18) Incident response playbook (V3)
+Typical incidents:
+- citation mismatch regression
+- bad freshness behavior on breaking topics
+- publisher value collapse in a cluster
+
+Controls:
+- kill switches (global, geo, cluster, risk tier)
+- rollback model alias in registry
+- tighten diversity and verification thresholds
+- route to verticals for impacted intents
