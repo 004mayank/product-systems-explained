@@ -37,6 +37,7 @@ You can start anywhere.
 - Architects and builders who want clean mental models
 
 ## Docs
+- [GitHub: Review Inbox + load-aware review routing](github-review-routing-architecture.md)
 - [Uber: Reduce post-match cancellations (Pickup Quality Pack)](uber-reduce-post-match-cancellations-architecture.md)
 - [Slack: Messaging notification load shaping](slack-messaging-architecture.md)
 - [WhatsApp: How messaging works](whatsapp-how-it-works-architecture.md)
@@ -46,5 +47,3 @@ You can start anywhere.
 - [Instagram: DMs conversation health](instagram-dms-conversation-health-architecture.md)
 - [CRED: Pay UPI architecture](cred-pay-upi-architecture.md)
 - [Lovable: How it works](lovable-how-it-works-architecture.md)
--
--
