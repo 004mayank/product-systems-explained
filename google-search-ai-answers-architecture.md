@@ -1,10 +1,10 @@
-# Google Search — AI Answers (Grounded) Without Breaking the Web (System Architecture V3)
+# Google Search - AI Answers (Grounded) Without Breaking the Web
 
 **Product:** Google Search (SERP)  
 **Audience:** PMs / Engineers  
 **Goal:** Describe an implementation-oriented, **generic (non-proprietary)** architecture for **grounded AI Answers** on the SERP with **trust, freshness, and web ecosystem guardrails**.
 
-**PRD reference (v3):**
+**PRD reference:**
 - https://github.com/004mayank/product-prd/blob/main/google-search-ai-answers-prd.md
 
 ---
@@ -29,7 +29,7 @@ V3 adds:
 
 ---
 
-## 2) Design principles (V3)
+## 2) Design principles
 1. **Conservative by default:** if unsure, fall back to classic results.
 2. **Grounding is mandatory:** generation is constrained to retrieved evidence.
 3. **Citations must be correct:** if verification fails, do not ship the answer.
@@ -87,7 +87,7 @@ V3 adds:
 
 ---
 
-## 5) System diagram (V3)
+## 5) System diagram 
 ```mermaid
 flowchart LR
   user["User"] --> serp["SERP Frontend"]
@@ -270,7 +270,7 @@ A publisher-facing control plane can expose:
 
 This requires careful abuse prevention and is typically rolled out gradually.
 
-## 15) Model governance and rollout safety (V3)
+## 15) Model governance and rollout safety 
 ### 15.1 Model registry
 Treat every model as a production dependency:
 - registry stores: `model_id`, `purpose`, `owner`, `risk_tier`, `approved_regions`, `expiry`
@@ -290,7 +290,7 @@ Treat every model as a production dependency:
 
 ---
 
-## 16) Abuse, manipulation, and injection resistance (V3)
+## 16) Abuse, manipulation, and injection resistance 
 ### 16.1 Prompt injection and untrusted text
 Assume retrieved pages may contain instructions for the model.
 Mitigations:
@@ -306,7 +306,7 @@ Signals can feed Risk Classifier and Guardrails:
 
 ---
 
-## 17) Privacy and data retention hooks (V3)
+## 17) Privacy and data retention hooks 
 - minimize raw query retention in logs; prefer hashed identifiers and aggregated metrics
 - PII detection can force `Links-only` or redact answer sections
 - retention tiers:
@@ -315,7 +315,7 @@ Signals can feed Risk Classifier and Guardrails:
 
 ---
 
-## 18) Incident response playbook (V3)
+## 18) Incident response playbook 
 Typical incidents:
 - citation mismatch regression
 - bad freshness behavior on breaking topics
