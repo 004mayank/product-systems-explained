@@ -4,8 +4,8 @@
 
 **PRD reference:** https://github.com/004mayank/product-prd/blob/main/notion-ai-prd.md
 
-**Version:** v2 - Improved system design  
-**Changes from v1:** Added Mermaid system diagram and generation request sequence diagram, full API contracts for context assembly and retrieval services, permission-scoped retrieval scaling analysis, session-level index cache design, competitive architecture comparison, expanded failure modes with mitigations, instrumentation spec with event schemas.
+**Version:** v3 - Final system design  
+**Changes from v2:** Added launch gates and kill switches with per-feature granularity, full NFR table with SLOs, multi-region deployment design, cost model at scale, graph-based retrieval extension design, complete rollout sequence aligned with PRD phases, index migration strategy, and open questions resolved.
 
 ---
 
@@ -15,6 +15,7 @@
 |---|---|
 | v1 | Core architecture (4 layers), data model, context assembly steps, vector index design, generation layer, index maintenance pipeline, AI surfaces, user journeys, trade-offs |
 | v2 | Mermaid diagrams, API contracts, permission-scoped retrieval scaling, session cache, competitive comparison, failure modes, instrumentation |
+| v3 | Launch gates, kill switches, NFR table, SLOs, multi-region design, cost model, graph-based retrieval, full rollout sequence, index migration, resolved open questions |
 
 ---
 
@@ -33,7 +34,26 @@ Hard constraint: **permission model is never relaxed**. A user only receives AI 
 
 ---
 
-## 2) System diagram
+## 2) Non-functional requirements (NFR table)
+
+| Requirement | Target | Measurement | Alert threshold |
+|---|---|---|---|
+| AI generation P95 latency (end-to-end) | <5,000ms | Production telemetry, rolling 1h | >5,000ms for >5 min |
+| Context assembly P95 latency | <800ms | Per-request span | >1,000ms triggers fallback |
+| RAG retrieval P95 latency | <500ms | Per-request span | >600ms triggers RAG skip |
+| AI generation availability | 99.5% | Rolling 7 days | <99.0% pages oncall |
+| RAG retrieval availability | 99.0% | Rolling 7 days | <98.5% disables RAG automatically |
+| Index freshness (median lag) | <24h | Per-workspace, rolling 24h | >36h triggers reindex job |
+| Permission leakage incidents | 0 | Security audit + anomaly detection | Any incident - immediate RAG disable for workspace |
+| Session cache hit rate | >60% | Rolling 1h per region | <40% investigate cache sizing |
+| Embedding cost per workspace (10k pages) | <$2/month | Monthly billing reconciliation | >$4/month review indexing frequency |
+| Data retention - generation requests | 90 days | Storage audit | None (compliance requirement) |
+| Data retention - vector embeddings | Until page deleted + 30 days | Storage audit | None |
+| Context bundle TTL | 300s | In-memory expiry | None |
+
+---
+
+## 3) System diagram
 
 ```mermaid
 flowchart TD
@@ -46,6 +66,7 @@ flowchart TD
 
     subgraph Gateway["API Gateway"]
         C[AI Generation Endpoint\nPOST /v1/ai/generate]
+        FF[Feature Flags\nper-workspace kill switches]
     end
 
     subgraph ContextAssembly["Context Assembly Service"]
@@ -58,28 +79,38 @@ flowchart TD
 
     subgraph VectorIndex["Vector Index Service"]
         I[Permission-scoped\nSimilarity Search]
-        J[Workspace Vector Store\nper-namespace embeddings]
-        K[Session Cache\nper-user, per-session]
+        J[Workspace Vector Store\nWeaviate / pgvector]
+        K[Session Cache\nRedis, per-user per-session]
+        GR[Graph Retrieval Layer\n@mention + DB relation bias]
     end
 
     subgraph IndexPipeline["Index Maintenance Pipeline"]
         L[Change Detector\npage event stream]
         M[Embedding Worker\ntext-embedding-3-small]
         N[Freshness Monitor\n+ stale reindex]
+        MIG[Migration Worker\nindex version upgrades]
     end
 
     subgraph Generation["Generation Service"]
         Q[Prompt Assembler]
-        R[LLM Client\nGPT-4o / Claude 3.5]
-        S[Stream Router\nback to editor]
+        R[LLM Client\nGPT-4o primary\nClaude 3.5 fallback]
+        S[Stream Router\nSSE back to editor]
     end
 
     subgraph Observability["Observability"]
-        T[Event Bus\nai_generation_outcome\nai_rag_timeout\nai_context_fallback]
+        T[Event Bus\nai_generation_outcome\nai_rag_timeout\nai_context_fallback\npage_indexed]
+        MON[Dashboards + Alerts\nDatadog / Grafana]
+    end
+
+    subgraph MultiRegion["Multi-Region (future)"]
+        REP[Index Replication\nleader-follower per region]
     end
 
     A --> C
     B --> C
+    C --> FF
+    FF --> D
+    FF --> G
     C --> D
     C --> E
     C --> F
@@ -87,7 +118,8 @@ flowchart TD
     D --> H
     E --> H
     F --> H
-    G --> I
+    G --> GR
+    GR --> I
     I --> K
     K --> J
     H --> Q
@@ -96,79 +128,99 @@ flowchart TD
     S --> O
     S --> P
     S --> T
+    T --> MON
 
     L --> M
     M --> J
     N --> J
     N --> T
+    MIG --> J
     G --> T
-    S --> T
+    J --> REP
 ```
 
 ---
 
-## 3) Generation request sequence
+## 4) Generation request sequence
 
 ```mermaid
 sequenceDiagram
     participant U as User (Editor)
-    participant GW as API Gateway
+    participant GW as API Gateway + Feature Flags
     participant CA as Context Assembly
+    participant GR as Graph Retrieval Layer
     participant VI as Vector Index
-    participant SC as Session Cache
+    participant SC as Session Cache (Redis)
     participant LLM as LLM Client
     participant EB as Event Bus
 
-    U->>GW: POST /v1/ai/generate {page_id, command, prompt}
-    GW->>CA: assemble_context(page_id, user_id, command, prompt)
+    U->>GW: POST /v1/ai/generate {page_id, command, prompt, session_id}
+    GW->>GW: check feature flags (rag_enabled, contextual_ai_enabled)
 
-    par Fetch page content
-        CA->>CA: fetch_page_blocks(page_id)
-    and Fetch DB properties
-        CA->>CA: fetch_db_properties(page_id)
-    and Resolve @mentions
-        CA->>CA: resolve_linked_pages(page_id, user_id)
-    and RAG retrieval (with 600ms timeout)
-        CA->>SC: get_cached_topk(user_id, session_id, query_embedding)
-        alt Cache hit
-            SC-->>CA: cached_results[]
-        else Cache miss
-            CA->>VI: search(query_embedding, workspace_id, user_acl, top_k=3)
-            VI-->>CA: results[]
-            CA->>SC: set_cache(user_id, session_id, results[])
+    alt contextual_ai_enabled = false (kill switch)
+        GW-->>U: stream generic LLM output (no context)
+    else contextual_ai_enabled = true
+        GW->>CA: assemble_context(page_id, user_id, command, prompt)
+
+        par Fetch page content
+            CA->>CA: fetch_page_blocks(page_id) [existing API]
+        and Fetch DB properties
+            CA->>CA: fetch_db_properties(page_id)
+        and Resolve @mentions
+            CA->>CA: resolve_linked_pages(page_id, user_id) [ACL check per page]
+        and RAG retrieval (600ms hard timeout)
+            CA->>SC: get_cached_topk(hash(user_id+session_id+embedding))
+            alt Cache hit
+                SC-->>CA: cached_results[]
+            else Cache miss
+                CA->>GR: enrich_query(prompt, page_id, user_id)
+                GR->>GR: extract @mention + DB relation graph for page
+                GR-->>CA: enriched_query + graph_boost_page_ids[]
+                CA->>VI: search(enriched_query, workspace_id, user_acl, graph_boost_ids, top_k=3)
+                VI-->>CA: results[] with scores
+                CA->>SC: set_cache(key, results[], ttl=1800)
+            end
         end
+
+        CA->>CA: assemble_token_budget()
+
+        alt RAG timeout exceeded (>600ms)
+            CA->>EB: emit ai_rag_timeout
+            note over CA: fallback_triggered = true
+        end
+
+        CA-->>GW: context_bundle
+
+        GW->>LLM: generate(context_bundle, model=gpt-4o)
+
+        alt GPT-4o error / rate limit
+            GW->>LLM: generate(context_bundle, model=claude-3-5-sonnet)
+        end
+
+        LLM-->>U: stream tokens (SSE)
+        LLM-->>GW: done event {request_id, rag_page_ids, latency_ms}
+
+        U->>GW: POST /v1/ai/outcome {outcome, edit_delta_pct}
+        GW->>EB: emit ai_generation_outcome
     end
-
-    CA->>CA: assemble_token_budget()
-
-    alt RAG timeout exceeded (>600ms)
-        CA->>EB: emit ai_rag_timeout
-        CA->>CA: fallback_triggered = true
-    end
-
-    CA-->>GW: context_bundle
-
-    GW->>LLM: generate(context_bundle, prompt, model)
-    LLM-->>U: stream tokens
-
-    U->>GW: POST /v1/ai/outcome {outcome, edit_delta_pct}
-    GW->>EB: emit ai_generation_outcome
 ```
 
 ---
 
-## 4) Core data model
+## 5) Core data model
 
 ### Page (existing Notion object, relevant fields)
 
 ```
-page_id         uuid
-workspace_id    uuid
-created_by      user_id
-permissions     ACL[]          // who can read/write
-block_count     int
-token_estimate  int            // approximate; updated on edit
-updated_at      timestamp
+page_id              uuid
+workspace_id         uuid
+created_by           user_id
+permissions          ACL[]
+block_count          int
+token_estimate       int
+updated_at           timestamp
+parent_page_id       uuid?          // for graph traversal
+db_id                uuid?          // if page is a DB entry
 ```
 
 ### VectorIndexEntry
@@ -177,14 +229,15 @@ updated_at      timestamp
 entry_id             uuid
 page_id              uuid
 workspace_id         uuid
-embedding_vector     float[1536]    // text-embedding-3-small dimension
-content_hash         sha256         // detect change without re-reading full content
+embedding_vector     float[1536]    // text-embedding-3-small
+content_hash         sha256
 token_count          int
 is_archived          bool
 is_deleted           bool
 last_indexed_at      timestamp
-page_updated_at      timestamp      // from page metadata; detect staleness
-index_version        int            // schema version for migrations
+page_updated_at      timestamp
+index_version        int            // incremented on schema migration
+graph_link_count     int            // number of @mention + DB relation links (graph signal)
 ```
 
 ### AIGenerationRequest
@@ -196,17 +249,19 @@ workspace_id         uuid
 page_id              uuid
 command              enum(write, summarise, draft, improve, translate, fix_spelling, page_starter)
 prompt_text          string
-context_bundle_id    uuid           // FK to assembled context snapshot
+context_bundle_id    uuid
 rag_enabled          bool
+graph_retrieval_used bool
 fallback_triggered   bool
 model                enum(gpt-4o, claude-3-5-sonnet)
 status               enum(pending, generating, completed, failed, fallback)
 created_at           timestamp
 completed_at         timestamp
 latency_ms           int
+region               string         // which region served this request
 ```
 
-### ContextBundle (ephemeral per request, TTL 300s)
+### ContextBundle (ephemeral, TTL 300s)
 
 ```
 bundle_id            uuid
@@ -218,9 +273,10 @@ rag_pages_tokens     int
 total_tokens         int
 rag_page_ids         uuid[]
 linked_page_ids      uuid[]
+graph_boosted_ids    uuid[]         // pages boosted by graph signal
 fallback_reason      string?
 created_at           timestamp
-ttl_s                int            // default 300
+ttl_s                int
 ```
 
 ### AIGenerationOutcome
@@ -247,12 +303,23 @@ workspace_id         uuid
 user_id              uuid
 results              VectorIndexEntry[]
 created_at           timestamp
-ttl_s                int            // default 1800 (30 min session window)
+ttl_s                int            // 1800
+```
+
+### FeatureFlag
+
+```
+flag_id              string         // e.g. "contextual_ai_enabled", "rag_retrieval_enabled"
+scope                enum(global, workspace, user)
+scope_id             uuid?          // workspace_id or user_id if scoped
+value                bool
+updated_at           timestamp
+updated_by           uuid
 ```
 
 ---
 
-## 5) API contracts
+## 6) API contracts
 
 ### POST /v1/ai/generate
 
@@ -276,39 +343,36 @@ ttl_s                int            // default 1800 (30 min session window)
 event: token
 data: {"token": "The", "request_id": "uuid"}
 
-event: token
-data: {"token": " core", "request_id": "uuid"}
-
 event: done
 data: {
   "request_id": "uuid",
   "context_bundle_id": "uuid",
   "rag_page_ids": ["uuid1", "uuid2", "uuid3"],
+  "graph_boosted": true,
   "fallback_triggered": false,
+  "model_used": "gpt-4o",
   "latency_ms": 3240
 }
 
 event: error
-data: {"code": "CONTEXT_ASSEMBLY_TIMEOUT", "message": "Context assembly exceeded budget", "fallback": true}
+data: {"code": "CONTEXT_ASSEMBLY_TIMEOUT", "fallback": true}
 ```
 
 **Error codes**
 
 | Code | Meaning | Client behaviour |
 |---|---|---|
-| `CONTEXT_ASSEMBLY_TIMEOUT` | Full assembly exceeded 800ms | Show output with fallback context; no user-visible error |
+| `CONTEXT_ASSEMBLY_TIMEOUT` | Full assembly exceeded 800ms | Proceed with fallback context; no user-visible error |
 | `RAG_TIMEOUT` | Vector store took >600ms | Fall back to page-only context; generation proceeds |
-| `PERMISSION_DENIED` | User cannot read the current page | Surface error: "You don't have access to this page" |
-| `WORKSPACE_INDEX_NOT_READY` | Index not yet built for new workspace | Proceed without RAG; emit `ai_rag_timeout` |
-| `RATE_LIMITED` | AI usage limit hit | Surface upgrade prompt for non-AI subscribers |
-
----
+| `PERMISSION_DENIED` | User cannot read the current page | Surface: "You don't have access to this page" |
+| `WORKSPACE_INDEX_NOT_READY` | Index not yet built for workspace | Proceed without RAG; log `ai_rag_timeout` |
+| `RATE_LIMITED` | AI usage limit hit | Surface upgrade prompt |
+| `KILL_SWITCH_ACTIVE` | Feature flag disabled for workspace | Fall back to generic LLM; no context injection |
 
 ### POST /v1/ai/outcome
 
-**Request**
-
 ```json
+// Request
 {
   "request_id": "uuid",
   "outcome": "accepted | discarded | partially_accepted",
@@ -317,93 +381,52 @@ data: {"code": "CONTEXT_ASSEMBLY_TIMEOUT", "message": "Context assembly exceeded
   "db_properties_populated": false,
   "time_to_outcome_ms": 8200
 }
+
+// Response
+{"outcome_id": "uuid", "recorded": true}
 ```
 
-**Response**
+### POST /v1/ai/index/search (internal)
 
 ```json
-{
-  "outcome_id": "uuid",
-  "recorded": true
-}
-```
-
----
-
-### POST /v1/ai/index/search (internal - Context Assembly -> Vector Index)
-
-**Request**
-
-```json
+// Request
 {
   "workspace_id": "uuid",
-  "user_acl": ["page_id_1", "page_id_2", "..."],
-  "query_embedding": [0.023, -0.112, "..."],
+  "user_acl_bitmap": "base64_encoded_bitmap",
+  "query_embedding": [0.023, -0.112],
+  "graph_boost_page_ids": ["uuid1", "uuid2"],
+  "graph_boost_weight": 0.2,
   "top_k": 3,
   "exclude_page_ids": ["current_page_id"],
   "include_archived": false
 }
-```
 
-**Response**
-
-```json
+// Response
 {
   "results": [
     {
       "page_id": "uuid",
       "score": 0.87,
+      "graph_boosted": true,
       "token_count": 1240,
       "last_indexed_at": "ISO8601",
       "page_title": "Q2 User Research - Search",
-      "excerpt": "string (first 200 chars of content)"
+      "excerpt": "first 200 chars"
     }
   ],
   "retrieval_latency_ms": 312,
-  "index_freshness_lag_h": 3.2
+  "index_freshness_lag_h": 3.2,
+  "cache_hit": false
 }
 ```
 
 ---
 
-## 6) Context assembly layer
+## 7) Context assembly layer
 
-Runs on every generation request. Hard latency budget: 800ms P95.
+Runs on every generation request. Hard latency budget: 800ms P95. All four sub-steps run in parallel.
 
-### Steps
-
-**Step 1 - Fetch current page content**
-
-Retrieve all text blocks for `page_id` via existing block content API.
-
-Token management:
-- `token_count <= 3,000`: inject full content.
-- `token_count > 3,000`: truncate from the bottom (preserve intro + most recent content); append `[page truncated]` marker.
-
-**Step 2 - Fetch DB properties (if page is a DB entry)**
-
-Fetch all typed properties. Serialize as structured JSON. Inject up to 400 tokens.
-
-- Formula properties: inject as computed value.
-- Relation/rollup: inject as referenced page titles only (no recursive resolution).
-
-**Step 3 - Resolve @mention links**
-
-Extract up to 3 `@mention` page links. For each:
-- Check read ACL for `user_id`.
-- Permitted: fetch content, extractively summarise to 400 tokens.
-- Not permitted: skip silently. Do not expose page title or existence.
-
-**Step 4 - RAG retrieval (async, 600ms hard timeout)**
-
-If `rag_enabled = true` and command in `[write, draft, summarise]`:
-
-1. Check `SessionIndexCache` for `hash(user_id + session_id + query_embedding)`.
-2. Cache hit: return cached results (skip vector store round trip entirely).
-3. Cache miss: embed `prompt + page_title` with `text-embedding-3-small`, query vector store with ACL filter, cache results for session TTL (1,800s).
-4. Timeout at 600ms: `fallback_triggered = true`; emit `ai_rag_timeout`; proceed without RAG.
-
-**Step 5 - Token budget assembly**
+### Token budget
 
 | Layer | Max tokens | Priority |
 |---|---|---|
@@ -416,72 +439,73 @@ If `rag_enabled = true` and command in `[write, draft, summarise]`:
 | Generation budget | 2,000 | Fixed |
 | **Total** | **~9,700** | Within GPT-4o 128k window |
 
-If total exceeds budget: drop RAG from 3 -> 2 -> 1 -> 0 pages in that order.
+Budget overflow: drop RAG 3 -> 2 -> 1 -> 0 pages, then drop linked pages 3 -> 2 -> 1 -> 0.
+
+### Step details
+
+- **Page content:** truncate from bottom at 3,000 tokens; append `[page truncated]`.
+- **DB properties:** formula = computed value; relation/rollup = referenced titles only.
+- **@mentions:** ACL check per page; skip + silent on no permission.
+- **RAG:** check session cache first; on miss, run graph enrichment then vector search; hard timeout 600ms.
 
 ---
 
-## 7) Vector index layer
+## 8) Vector index layer
 
-### Architecture decision
+### Storage strategy by workspace size
 
-| Option | Pros | Cons | Verdict |
-|---|---|---|---|
-| Dedicated vector DB per workspace (Pinecone) | Strong isolation; no cross-workspace risk | Prohibitive cost at 100k+ workspaces | Reject for v1 |
-| Shared vector DB, workspace-namespaced (Weaviate) | Lower cost; good isolation via namespace | Requires careful permission enforcement at query time | Chosen for v1 |
-| Postgres + pgvector | Simple ops; no new infra | Query perf degrades at >100k embeddings per workspace | Use for workspaces <10k pages; migrate to Weaviate above |
+| Workspace size | Storage | Rationale |
+|---|---|---|
+| <10k pages | Postgres + pgvector | No new infra; simple ops; adequate query performance |
+| 10k - 500k pages | Weaviate (shared, workspace-namespaced) | ANN search performance; bitmap ACL filter native support |
+| >500k pages (enterprise) | Weaviate with tiered index | Public workspace index + private pages index; reduces ACL filter size by ~80% |
 
-### Permission-scoped retrieval - the scaling problem
+### Permission-scoped retrieval
 
-The naive implementation: fetch all pages user can read, filter vector results to that set.
+**ACL bitmap filter (v1):** encode user permissions as a bitmap computed once per session and cached in Redis. Vector store evaluates bitmap filter during ANN search - O(1) per candidate. Weaviate and Pinecone both support native bitmap filtering on vector queries.
 
-**Problem at scale:** An enterprise workspace with 50,000 pages and a user who can read 40,000 of them. The ACL set passed to the vector store is 40,000 page IDs. This is a large filter payload on every query.
+**Tiered index (v2 for enterprise):** split into `workspace_public` namespace (pages readable by all workspace members) and `workspace_private` namespace (restricted pages). ~80% of queries hit public namespace only, reducing ACL bitmap size dramatically.
 
-**Solutions (in order of complexity):**
+### Graph-based retrieval extension
 
-1. **ACL bitmap filter (v1):** Encode user permissions as a bitmap; vector store supports bitmap-filtered ANN search. Weaviate and Pinecone both support this natively. Bitmap filter is computed once per session and cached.
+**Problem with semantic-only retrieval:** two pages may have low semantic similarity but high relational relevance (e.g., a design spec and its linked user research doc). Semantic similarity alone misses this.
 
-2. **Tiered index (v2):** Separate "public workspace" index (all pages readable by all workspace members) from "private" index (pages with restricted access). Most queries hit the public index; private page retrieval only runs for users with private page access. Reduces filter computation by ~80% for typical workspaces.
+**Solution:** at query time, extract the @mention and DB relation graph for the current page. Pages that are one hop away in the graph receive a score boost (`graph_boost_weight = 0.2`) applied post-ANN before final ranking.
 
-3. **Role-based shard (future):** For very large enterprise workspaces, shard the index by team/department. ACL filter is applied per shard in parallel.
+```
+final_score = semantic_score * (1 - graph_boost_weight)
+            + graph_adjacency_score * graph_boost_weight
+```
 
-### Session-level cache design
+Where `graph_adjacency_score = 1.0` if directly linked, `0.5` if two hops, `0.0` otherwise.
 
-**Problem:** Each RAG query requires an embedding call (100ms) + vector store query (200-400ms). For a user triggering AI 5 times per session, this is 5 round trips.
+This is a lightweight addition - no new index needed, just graph traversal on existing Notion page metadata at query time.
 
-**Solution:** `SessionIndexCache` keyed by `hash(user_id + session_id + query_embedding)`.
+### Session cache
 
-- TTL: 1,800s (30 min) - covers a typical active editing session.
-- Invalidation: if a page the user can access is edited during the session, the cache is cleared for that user.
-- Hit rate target: >60% of RAG calls within active sessions.
-- Storage: in-memory (Redis); not persisted across sessions.
-
-**Edge case:** User edits a page that was in their cached RAG results. The session cache is cleared immediately on `page_updated` event for that user's active sessions. Next query re-fetches from vector store with fresh index.
+- Redis; keyed by `hash(user_id + session_id + query_embedding)`.
+- TTL: 1,800s.
+- Invalidated on `page_updated` for any page the user has access to in this workspace.
+- Hit rate target: >60% within active editing sessions.
+- Reduces per-query latency by ~300ms on cache hit (skips embedding call + vector search).
 
 ### Index operations
 
-**Upsert trigger:** page block content changes by >50 tokens.
+**Upsert:** triggered when page block content changes >50 tokens. Compute `content_hash`; skip if unchanged. Embed -> upsert -> clear user session caches for workspace.
 
-1. Read page content.
-2. Compute `content_hash`. If unchanged: no-op.
-3. Embed using `text-embedding-3-small`.
-4. Upsert `VectorIndexEntry`.
-5. Clear session caches for all users with access to this workspace.
+**Delete:** `is_deleted = true`; excluded from queries immediately; hard delete after 30 days.
 
-**Delete:** mark `is_deleted = true`; exclude from queries; hard delete after 30 days.
-
-**Archive:** mark `is_archived = true`; still indexed; retrieval can optionally exclude.
-
-**Permission change:** ACL enforced at query time, not index time. No re-index on permission change. Immediate effect.
+**Permission change:** no re-index; ACL enforced at query time. Instant effect.
 
 ---
 
-## 8) Generation layer
+## 9) Generation layer
 
 ### Prompt structure
 
 ```
-[System prompt - 800 tokens max]
-You are Notion AI. You have been provided workspace context below.
+[System prompt - 800 tokens]
+You are Notion AI. You have workspace context below.
 Only generate content grounded in the provided context.
 Do not invent facts about the workspace.
 When referencing retrieved pages, mention them by name.
@@ -489,15 +513,14 @@ When referencing retrieved pages, mention them by name.
 [Current page - up to 3,000 tokens]
 Page: {title}
 Path: {breadcrumb}
-Content:
-{page_content_blocks}
+Content: {blocks}
 
-[DB properties - up to 400 tokens, if applicable]
+[DB properties - up to 400 tokens, if DB entry]
 Properties: {db_properties_json}
 
-[Linked pages from @mentions - up to 1,200 tokens]
+[Linked pages - up to 1,200 tokens]
 Linked page: {title}
-{summary}
+{extractive_summary}
 
 [Retrieved workspace pages - up to 1,800 tokens]
 Retrieved: {title} (last updated {date})
@@ -507,87 +530,198 @@ Retrieved: {title} (last updated {date})
 {command}: {prompt_text}
 ```
 
+### Model routing
+
+1. Primary: GPT-4o
+2. Fallback (on 5xx or rate limit): Claude 3.5 Sonnet
+3. Both use identical prompt structure and context bundle
+4. Model selection is server-side only; not user-facing in v1
+5. `model_used` is logged in every `AIGenerationRequest` for cost attribution
+
 ### Streaming
 
-Generation output is streamed token-by-token to the editor via SSE. Required because P95 generation latency exceeds 5s for longer outputs. Streaming preserves perceived responsiveness.
-
-### Model fallback
-
-Primary: GPT-4o. Fallback: Claude 3.5 Sonnet (if GPT-4o is rate-limited or returns error).
-
-Both models use the same context bundle and prompt structure. The fallback is transparent to the user. Model selection is server-side only; not a user-facing setting in v1.
+Token-by-token via SSE. Required - P95 generation is 3-5s for longer outputs. Streaming preserves perceived responsiveness.
 
 ---
 
-## 9) Index maintenance pipeline
+## 10) Index maintenance pipeline
 
 ### Change detector
 
-Subscribes to Notion page event stream (`page_created`, `page_updated`, `page_deleted`, `page_archived`).
-
-For updates: checks token count delta. Skips if delta <50 tokens.
+Subscribes to `page_created`, `page_updated`, `page_deleted`, `page_archived` events. For updates: checks token delta; ignores <50 token changes.
 
 ### Embedding worker
 
-Reads page content -> calls `text-embedding-3-small` -> upserts to vector store.
+Read page -> embed (`text-embedding-3-small`) -> upsert to vector store -> clear session caches for workspace.
 
-Failure handling: exponential backoff, max 3 retries. On final failure: emit `index_failure` event; continue with stale index (stale retrieval > no retrieval).
+Failure: exponential backoff, max 3 retries. On failure: emit `index_failure`; continue with stale index.
 
-### Freshness monitor
-
-Background job - runs every 6h.
-
-Computes for each workspace: median lag between `page_updated_at` and `last_indexed_at`.
+### Freshness monitor (runs every 6h)
 
 | Condition | Action |
 |---|---|
-| Median lag >24h | Emit `index_staleness_alert`; trigger reindex batch |
-| Any page lag >7 days | Force re-embed regardless of change threshold |
-| Workspace has >0 `index_failure` events in last 24h | Page oncall |
+| Median index lag >24h | `index_staleness_alert`; trigger reindex batch |
+| Any page lag >7 days | Force re-embed |
+| >0 `index_failure` events in 24h | Page oncall |
+
+### Index migration worker
+
+When `index_version` is incremented (e.g., embedding model upgrade):
+
+1. Background worker processes pages in batches (100 pages/batch).
+2. Re-embeds with new model.
+3. Writes new vector with `index_version = N+1`.
+4. Old version kept until migration complete for that workspace.
+5. Migration progress tracked per workspace; alerts on stall.
 
 ### Deleted page cleaner
 
-Runs hourly. Hard deletes entries where `is_deleted = true` and `last_indexed_at` >30 days ago.
+Hourly. Hard deletes where `is_deleted = true` and `last_indexed_at` >30 days ago.
 
 ---
 
-## 10) Competitive architecture comparison
+## 11) Launch gates + kill switches
 
-| Product | Context approach | RAG mechanism | Permission model | Key difference vs. Notion |
+### Kill switches (all pre-built before Phase 0)
+
+| Flag | Scope | Default | Effect when disabled |
+|---|---|---|---|
+| `contextual_ai_enabled` | Global / workspace | true | Fall back to generic LLM (no context injection) |
+| `rag_retrieval_enabled` | Global / workspace | true | Page-only context injection; no workspace retrieval |
+| `page_starter_enabled` | Global / workspace | true | No page starter prompt shown |
+| `db_property_fill_enabled` | Global / workspace | true | No "Fill properties" button after generation |
+| `graph_retrieval_enabled` | Global | false | Use semantic-only retrieval (graph boost disabled) |
+
+All flags evaluated at request time from `FeatureFlag` table. No restart required. Per-workspace flags override global flags.
+
+### Launch gates (per PRD Phase plan)
+
+**Phase 0 - Internal (week 1-2)**
+
+- [ ] Context injection fallback rate <5% in internal dogfood
+- [ ] Zero permission leakage in security penetration test
+- [ ] AI generation P95 <5s in internal load test (100 RPS)
+- [ ] All kill switches verified working end-to-end
+
+**Phase 1 - 5% rollout (week 3-4)**
+
+- [ ] No increase in workspace-level error rate vs. baseline
+- [ ] RAG timeout rate <10%
+- [ ] AI generation P95 <5s in production at 5% traffic
+- [ ] Acceptance rate trending positive vs. control (A/B Experiment 1)
+
+**Phase 2 - 50% rollout (week 5-8)**
+
+- [ ] Experiment 1 primary metric statistically significant at 95% confidence, positive direction
+- [ ] No guardrail metric regression (latency, error rate, trial conversion)
+- [ ] Session cache hit rate >40%
+- [ ] Opt-out toggle available in AI settings (Req 2.6)
+
+**Phase 3 - 100% rollout (week 9+)**
+
+- [ ] All experiments concluded; winning variants shipped
+- [ ] 90-day churn cohort monitoring active
+- [ ] Enterprise workspace admin controls live (audit log, opt-out per workspace)
+- [ ] Index migration worker ready for future model upgrades
+
+---
+
+## 12) Multi-region deployment
+
+### Problem
+
+Notion serves users globally. A workspace in Europe querying the vector store in US-East adds 100-200ms round-trip latency to every RAG call - which may push retrieval over the 600ms timeout.
+
+### v1 approach (single region)
+
+All AI generation and vector index hosted in US-East. Acceptable for launch - global latency impact is within tolerance given the 600ms timeout and fallback design.
+
+### v2 approach (region-aware routing)
+
+1. Vector index replicated to EU-West and AP-Southeast using leader-follower replication.
+2. Write path: all index writes go to leader (US-East); replicated async within 60s.
+3. Read path: generation requests routed to nearest regional follower for RAG retrieval.
+4. Replication lag <60s means retrieval is eventually consistent - acceptable given 24h index freshness SLA.
+5. Session cache is regional (Redis per region); no cross-region cache sharing.
+
+### Consistency trade-off
+
+| Property | v1 (single region) | v2 (multi-region) |
+|---|---|---|
+| RAG retrieval latency | 200-400ms (US users) / 400-700ms (EU/AP) | 200-400ms globally |
+| Index consistency | Immediate | Eventually consistent (~60s replication lag) |
+| Cost | Lower | Higher (3x vector store + Redis) |
+| Complexity | Low | Medium (replication + routing) |
+
+---
+
+## 13) Cost model
+
+### Embedding cost (text-embedding-3-small: $0.02 / 1M tokens)
+
+| Workspace size | Pages | Avg tokens/page | Initial index cost | Monthly re-index cost |
 |---|---|---|---|---|
-| **Coda AI** | Reads current doc + Pack data sources | Doc-scoped only; no cross-doc retrieval | Doc-level permissions | Narrower scope (current doc only); no workspace-wide retrieval |
-| **Confluence AI (Atlassian Intelligence)** | Pulls from Atlassian knowledge graph (Confluence + Jira) | Cross-space search via Atlassian index | Confluence permission model (space + page level) | Richer cross-product graph (Jira data); enterprise ACL maturity |
-| **Google Workspace Duet AI** | Reads Drive files + Gmail + Calendar | Google's internal search index | Google Workspace ACL | Broader surface (email + calendar context); not doc-native |
-| **Notion AI (this spec)** | Current page + @mentions + workspace-wide RAG | Per-workspace vector index; permission-scoped at query time | Notion page ACL (most granular) | Uniquely positioned: richest page graph; most granular per-page ACL; inline generation in the doc itself |
+| Small (1k pages) | 1,000 | 500 | $0.01 | ~$0.03 (10% churn/mo) |
+| Medium (10k pages) | 10,000 | 800 | $0.16 | ~$0.50 |
+| Large (100k pages) | 100,000 | 1,000 | $2.00 | ~$6.00 |
+| Enterprise (500k pages) | 500,000 | 1,200 | $12.00 | ~$30.00 |
 
-**Notion's architectural advantage:** the page graph (pages linked via @mentions and DB relations) is a first-class retrieval signal that no competitor has. Future versions can use the graph structure (not just semantic similarity) to bias retrieval toward pages that are structurally related to the current page.
+### Generation cost (GPT-4o: ~$5/1M input tokens, ~$15/1M output tokens)
+
+| Context size | Avg input tokens | Avg output tokens | Cost per generation |
+|---|---|---|---|
+| Page-only context | 4,300 | 600 | ~$0.030 |
+| Full context (page + RAG) | 9,700 | 800 | ~$0.060 |
+
+At 10M generations/month (inferred scale for Notion's user base): ~$600k/month generation cost at full context. The $8/user/month AI add-on must cover this plus margin - requires careful token budget management and caching to stay unit-economics positive.
+
+**Cost levers:**
+- Session cache reduces embedding calls by >60% - biggest lever.
+- Extractive summarisation of RAG pages (not full injection) reduces input tokens by ~40% vs. raw injection.
+- Context budget caps prevent runaway costs on very large pages.
 
 ---
 
-## 11) Failure modes + mitigations
+## 14) Failure modes + mitigations
 
 | Failure | Detection | Mitigation | Degraded state |
 |---|---|---|---|
-| Vector store unavailable | `ai_rag_timeout` rate spikes; health check fails | Circuit breaker on vector store client; auto-disable RAG; re-enable when health check passes | Generation continues on page-only context; no user-visible error |
-| Embedding API unavailable (OpenAI) | Embedding call returns 5xx; timeout | Retry 3x; fall back to lexical search (BM25) as stopgap for RAG | Lexical search quality is lower but non-zero; maintains some retrieval value |
-| Index severely stale (>7 days lag) | Freshness monitor alert | Force full workspace reindex; page oncall | RAG retrieves stale content; `last_updated` shown in Sources disclosure alerts user |
-| Permission leakage (critical) | Security audit; anomaly detection on cross-user page access | ACL enforced at query time; penetration test before launch; automated regression suite on every deploy | Zero tolerance; any detection triggers RAG disabled immediately for affected workspace |
-| Context assembly exceeds 800ms | P95 latency alert on context assembly service | Reduce RAG top-K; increase timeout threshold with alert; fallback to page-only | Generation proceeds; RAG may be partially or fully skipped |
-| LLM returns empty or malformed output | Empty token stream; JSON parse error on done event | Retry once with temperature=0; show "Try again" button to user | User sees "Try again" prompt; no silent failure |
-| Session cache stale (page edited mid-session) | `page_updated` event for user's accessible pages | Invalidate session cache for that user on `page_updated` | Next RAG query re-fetches from vector store; minor latency increase |
+| Vector store unavailable | `ai_rag_timeout` spike; health check fails | Circuit breaker; auto-disable RAG via `rag_retrieval_enabled = false`; re-enable on recovery | Page-only context; no user error shown |
+| Embedding API down (OpenAI) | 5xx on embed call; timeout | Retry 3x; fall back to BM25 lexical search for RAG | Lower quality retrieval; maintains some context value |
+| Index severely stale (>7 days) | Freshness monitor alert | Force full reindex; page oncall | RAG retrieves stale content; Sources shows `last_updated` |
+| Permission leakage | Security audit; anomaly detection | ACL at query time; pentest pre-launch; regression suite on every deploy | Zero tolerance: disable RAG immediately for affected workspace |
+| Context assembly >800ms | P95 latency alert | Reduce RAG top-K; fallback to page-only on timeout | Generation proceeds; lower quality |
+| LLM empty/malformed output | Empty stream; parse error | Retry once at temperature=0; show "Try again" to user | User sees retry prompt; no silent failure |
+| Session cache stale mid-session | `page_updated` event during session | Invalidate user session cache on `page_updated` | Next query re-fetches; minor latency increase |
+| Index migration stall | Migration worker heartbeat; % complete alert | Retry migration batch; old version serves until migration complete | Stale embeddings for in-progress pages |
+| GPT-4o rate limit | 429 from OpenAI | Route to Claude 3.5 Sonnet fallback | Slightly different output characteristics; transparent to user |
 
 ---
 
-## 12) Observability + instrumentation
+## 15) Competitive architecture comparison
 
-### Key dashboards
+| Product | Context approach | RAG mechanism | Permission model | Key difference vs. Notion |
+|---|---|---|---|---|
+| **Coda AI** | Current doc + Pack data sources | Doc-scoped only; no cross-doc retrieval | Doc-level permissions | No workspace-wide retrieval; narrower context |
+| **Confluence AI** | Atlassian knowledge graph (Confluence + Jira) | Cross-space search via Atlassian index | Space + page level ACL | Cross-product graph (Jira); enterprise ACL maturity |
+| **Google Workspace Duet AI** | Drive + Gmail + Calendar | Google internal search index | Google Workspace ACL | Broader surface (email + calendar); not doc-native |
+| **Notion AI (this spec)** | Current page + @mentions + workspace-wide RAG + graph boost | Per-workspace vector index; permission-scoped at query time; graph-enriched | Per-page ACL (most granular) | Richest page graph; most granular ACL; inline generation; graph retrieval advantage |
 
-| Dashboard | Metrics shown | Alert threshold |
+**Structural moat:** Notion's page graph (pages linked via @mentions and DB relations) is a first-class retrieval signal no competitor replicates. Confluence has Jira links but no equivalent of Notion's flexible @mention graph across docs, databases, and tasks. This graph becomes more valuable over time as workspaces accumulate more cross-links.
+
+---
+
+## 16) Observability + instrumentation
+
+### Dashboards
+
+| Dashboard | Key metrics | Alert threshold |
 |---|---|---|
 | AI Generation Health | Request rate, P50/P95/P99 latency, error rate by command | P95 >5s; error rate >1% |
-| RAG Pipeline | Retrieval latency, timeout rate, cache hit rate, fallback rate | Timeout rate >10%; cache hit rate <40% |
-| Index Freshness | Median index lag per workspace, stale workspace count | Median lag >24h; stale workspaces >5% |
-| Outcome Quality | Acceptance rate, edit delta distribution, discard rate | Acceptance rate <20% (signals context regression) |
+| RAG Pipeline | Retrieval latency, timeout rate, cache hit rate, fallback rate | Timeout >10%; cache hit <40% |
+| Index Freshness | Median lag per workspace, stale workspace % | Median lag >24h; stale workspaces >5% |
+| Outcome Quality | Acceptance rate, edit delta, discard rate | Acceptance rate <20% |
+| Cost | Embedding cost/day, generation cost/day, cost per accepted output | Generation cost >$25k/day |
 
 ### Instrumentation events
 
@@ -603,7 +737,9 @@ Runs hourly. Hard deletes entries where `is_deleted = true` and `last_indexed_at
   "outcome": "accepted | discarded | partially_accepted",
   "context_sources_used": ["page_content", "db_properties", "linked_pages", "rag_retrieval"],
   "retrieved_page_count": 3,
+  "graph_retrieval_used": true,
   "fallback_triggered": false,
+  "model_used": "gpt-4o",
   "edit_delta_pct": 14.2,
   "sources_disclosure_opened": false,
   "db_properties_populated": false,
@@ -611,6 +747,7 @@ Runs hourly. Hard deletes entries where `is_deleted = true` and `last_indexed_at
   "context_assembly_latency_ms": 680,
   "rag_retrieval_latency_ms": 290,
   "generation_latency_ms": 2270,
+  "region": "us-east-1",
   "ts": "ISO8601"
 }
 
@@ -622,16 +759,7 @@ Runs hourly. Hard deletes entries where `is_deleted = true` and `last_indexed_at
   "page_id": "uuid",
   "retrieval_duration_ms": 623,
   "fallback_applied": true,
-  "ts": "ISO8601"
-}
-
-// ai_context_fallback
-{
-  "event": "ai_context_fallback",
-  "user_id": "uuid",
-  "workspace_id": "uuid",
-  "page_id": "uuid",
-  "fallback_reason": "injection_timeout | rag_timeout | permission_error | index_not_ready",
+  "region": "us-east-1",
   "ts": "ISO8601"
 }
 
@@ -643,55 +771,59 @@ Runs hourly. Hard deletes entries where `is_deleted = true` and `last_indexed_at
   "token_count": 1240,
   "embedding_latency_ms": 180,
   "index_lag_ms": 14400000,
+  "index_version": 2,
   "ts": "ISO8601"
 }
 
-// index_staleness_alert
+// kill_switch_triggered
 {
-  "event": "index_staleness_alert",
-  "workspace_id": "uuid",
-  "median_lag_hours": 28.4,
-  "stale_page_count": 42,
+  "event": "kill_switch_triggered",
+  "flag_id": "rag_retrieval_enabled",
+  "scope": "workspace",
+  "scope_id": "uuid",
+  "triggered_by": "auto | manual",
+  "reason": "permission_leakage | latency_breach | manual_disable",
   "ts": "ISO8601"
 }
 ```
 
 ---
 
-## 13) Security + privacy
+## 17) Security + privacy
 
-### Permission enforcement
+### Permission enforcement (non-negotiable invariants)
 
-- ACL checked at context assembly time, not at index time.
-- `@mention` linked pages: read permission verified per page before injection.
-- RAG retrieval: user ACL passed as filter to vector store query; results never returned for pages outside the ACL.
+- ACL checked at context assembly time per page, not at index time.
+- RAG retrieval: user ACL bitmap passed to vector store; results filtered to user-readable pages only.
 - No cross-workspace retrieval under any circumstances.
-
-### Data handling
-
-- `ContextBundle` is ephemeral: TTL 300s; not logged to persistent storage.
-- Raw page content is never logged in generation requests - only `page_id` and token counts.
-- `embedding_vector` is stored per page but is not reversible to original content (one-way transform).
+- `ContextBundle` ephemeral: TTL 300s; not persisted to long-term storage.
+- Raw page content never logged in generation requests - `page_id` and token counts only.
+- `embedding_vector` is not reversible to original content.
 
 ### Audit trail
 
-- Every `AIGenerationRequest` is persisted for 90 days.
-- Every `AIGenerationOutcome` is persisted for 90 days.
-- Workspace admins can request a log of all AI activity for their workspace (for enterprise compliance).
+- Every `AIGenerationRequest` persisted 90 days.
+- Every `AIGenerationOutcome` persisted 90 days.
+- Workspace admins can export full AI activity log (enterprise compliance).
+- `kill_switch_triggered` events are immutable audit log entries.
 
-### Pre-launch security requirements
+### Pre-launch security checklist
 
-- [ ] Penetration test on permission filter in vector store query (cross-workspace and cross-user scenarios).
-- [ ] Automated regression test: guest user cannot receive output grounded in restricted pages.
-- [ ] Load test on ACL bitmap filter at enterprise workspace scale (50k pages, 30k ACL entries per user).
+- [ ] Penetration test: cross-workspace and cross-user permission isolation in vector store queries.
+- [ ] Regression test: guest user cannot receive output grounded in pages they cannot read.
+- [ ] Load test: ACL bitmap filter performance at enterprise scale (500k pages, 300k ACL entries).
+- [ ] Red team: attempt to extract restricted page content via prompt injection in `prompt_text`.
+- [ ] Automated regression suite runs on every production deploy; gates deployment on pass.
 
 ---
 
-## 14) What v3 will add
+## 18) Open questions - resolved
 
-- Launch gates and kill switches with per-feature and per-workspace granularity.
-- Full NFR table (availability SLOs, latency SLOs, data retention requirements).
-- Multi-region deployment considerations (vector index replication, latency implications).
-- Cost model: embedding cost per workspace per month at different scales.
-- Graph-based retrieval extension design (use @mention and DB relation graph to bias RAG, not just semantic similarity).
-- Complete rollout sequence aligned with PRD Phase 0 -> 3 plan.
+| Question | Resolution |
+|---|---|
+| Single vector store vs. per-workspace | Shared Weaviate with workspace-namespaced collections for v1; tiered index for enterprise in v2. Cost and ops complexity are the deciding factors. |
+| Embedding model: text-embedding-3-small vs. large | `text-embedding-3-small` chosen for v1: 5x cheaper, adequate semantic quality for workspace-scale retrieval. Revisit if acceptance rate plateaus. |
+| Graph retrieval: query-time boost vs. index-time graph embedding | Query-time boost chosen: no new index infrastructure; graph adjacency computed from page metadata at query time; simpler to iterate on boost weight. |
+| Multi-region: v1 or v2 | Single region for v1; multi-region in v2 when global latency data confirms timeout impact on non-US users. |
+| Index migration on model upgrade | Background migration worker maintaining dual-version entries until migration complete; no downtime, no degradation during migration. |
+| Cost per accepted generation | ~$0.06 at full context; ~$0.03 at page-only context. At $8/user/month add-on pricing, unit economics are positive if average user triggers <100 accepted generations/month. Session cache is the primary cost lever. |
