@@ -4,8 +4,8 @@
 
 **PRD reference:** https://github.com/004mayank/product-prd/blob/main/figma-design-system-aware-ai-prd.md
 
-**Version:** v2 - Improved system design
-**Changes from v1:** Added Mermaid system architecture diagram and generation sequence diagram, full API contracts with error codes and SLOs, architectural instrumentation schema (service-level observability events), competitive architecture analysis (Galileo AI vs. Figma vs. Diagram plugin), scaling model (sharding, concurrency, cost at scale), expanded failure modes with circuit breaker design, inter-service communication patterns, and component embedding pipeline deep dive.
+**Version:** v3 - Final system design
+**Changes from v2:** Added NFR table with explicit SLOs and alert thresholds, kill switch architecture (per-layer granularity), experiment backlog with instrumentation requirements for each experiment, phased rollout plan aligned with PRD phases, all seven open questions from v2 resolved with decisions and rationale, index migration strategy for embedding model upgrades, multi-region deployment design for GDPR compliance, and production readiness checklist.
 
 ---
 
@@ -15,6 +15,7 @@
 |---|---|
 | v1 | Core architecture (5 layers), data flow, library context payload schema, component matching logic, compliance computation, failure modes, trade-offs, user journeys |
 | v2 | Mermaid diagrams (system + sequence), API contracts with error codes, architectural observability schema, competitive architecture comparison, scaling model, circuit breaker design, embedding pipeline detail, inter-service communication patterns |
+| v3 | NFR table with SLOs, kill switch architecture, experiment backlog with instrumentation specs, phased rollout plan, all seven open questions resolved, embedding model migration strategy, multi-region deployment design, production readiness checklist |
 
 ---
 
@@ -36,7 +37,27 @@ Hard constraint: **Library context is used only for in-session generation.** It 
 
 ---
 
-## 2) Core problem the architecture must solve
+## 2) Non-functional requirements (NFR table)
+
+| Requirement | Target | Measurement | Alert threshold | Kill condition |
+|---|---|---|---|---|
+| Context injection P50 latency | <300ms | Per-request span (cache hit path) | >500ms for >5 min | >1,500ms P95 triggers CIS circuit breaker |
+| Context injection P95 latency | <800ms | Per-request span (cache miss path) | >1,000ms for >5 min | >1,500ms P95 triggers CIS circuit breaker |
+| End-to-end generation P95 (standard library, <200 components) | <10s | `generation_latency_ms` field in event | >12s for >5 min | >15s sustained - page on-call |
+| End-to-end generation P95 (large library, 400-500 components) | <12s | `generation_latency_ms` field in event | >15s for >5 min | >18s sustained - page on-call |
+| Library index freshness (time from `library_published` to index ready) | <5 min | `library_index_updated.index_latency_ms` | >8 min for any org | >15 min for >5% of orgs - page on-call |
+| `library_context_injection_failure_rate` | <0.5% | Rolling 5-min window | >1% (warn) | >2% (critical) - trigger global fallback to generic generation |
+| Compliance computation P95 latency | <500ms | `compliance_computed.computation_latency_ms` | >600ms for >5 min | >800ms - return degraded 206 response |
+| Library context injection service availability | 99.9% | Rolling 7-day window | <99.5% | <99.0% - escalate to engineering lead |
+| Compliance service availability | 99.5% | Rolling 7-day window | <99.0% | <98.5% - disable compliance panel, proceed with frame-only output |
+| Redis cache hit rate (context injection) | >70% | Rolling 1h per region | <50% investigate TTL or key collision | <30% - review sharding |
+| Embedding pipeline queue depth | <200 items | Queue depth metric | >500 items | >1,000 items - scale embedding worker horizontally |
+| Component instance accuracy (proxy: `variant_swapped_immediately` <60s) | <15% swap rate | Computed from event sequence | >20% swap rate over 7-day rolling window | >30% - pause variant confidence feature; audit selection model |
+| Privacy: library context retained post-session | 0 incidents | Security audit + TTL enforcement logs | Any retention anomaly | Any confirmed incident - disable context injection globally; page security lead |
+
+---
+
+## 3) Core problem the architecture must solve
 
 The naive approach to library-grounded generation is to include the entire library as text in the LLM prompt. This fails for three reasons:
 
@@ -51,7 +72,7 @@ The architecture solves this with three mechanisms:
 
 ---
 
-## 3) System architecture diagram
+## 4) System architecture diagram
 
 ```mermaid
 flowchart TD
@@ -141,7 +162,7 @@ flowchart TD
 
 ---
 
-## 4) Generation sequence diagram
+## 5) Generation sequence diagram
 
 ```mermaid
 sequenceDiagram
@@ -207,7 +228,58 @@ sequenceDiagram
 
 ---
 
-## 5) System layers
+## 6) Kill switch architecture
+
+Kill switches operate at three levels of granularity. Each level has an independent flag, monitoring trigger, and recovery path. They are designed to be additive - a lower-level switch (e.g., compliance panel) can be disabled without affecting the generation pipeline.
+
+### Level 1: Global library injection kill switch
+
+**Flag:** `global_library_context_injection_enabled` (default: true)
+
+**Trigger conditions (any one sufficient):**
+- `library_context_injection_failure_rate` > 2% over 5 minutes across all orgs
+- Library Index Service unavailable in the primary region for >10 minutes
+- Security incident involving library context data retention
+
+**Effect:** All generation sessions fall back to generic (non-library) `Make Designs` output. No user-visible error - the generation proceeds normally without library context. `library_context_injected = false` in all events.
+
+**Recovery:** Manual re-enable by on-call engineer after root cause is identified. Minimum hold: 30 minutes post-recovery confirmation.
+
+**Who can trigger:** Any on-call engineer via feature flag console. Automated trigger via PagerDuty integration.
+
+---
+
+### Level 2: Per-layer kill switches (independent)
+
+| Layer | Flag | Trigger | Fallback behaviour |
+|---|---|---|---|
+| Component matching | `disable_component_matching` | `variant_swapped_immediately` rate >30% (7-day rolling) | Generate with variable and text style injection only; component matching off; all elements flagged as `library_gap` |
+| Variable injection | `disable_variable_injection` | Variable conflict causing incorrect token application in >5% of sessions (detected via `variable_coverage_pct` anomaly) | Generate with component matching and text style injection; all color fills use hardcoded hex from library context |
+| Text style injection | `disable_text_style_injection` | Text style misapplication rate >10% (measured by `text_style_coverage_pct` anomaly) | Generate with component and variable injection; text nodes use raw font values from nearest library text style |
+| Compliance panel | `disable_compliance_panel` | Compliance service P95 latency >800ms sustained for >10 min; or CCS availability <98.5% | Frame placed on canvas without compliance panel; `compliance_panel_viewed` event not emitted; `degraded: true` in generation event |
+| Library gap notifications | `disable_gap_notifications` | Gap pipeline consumer lag >5 min; or notification delivery failures >10% | Gap events still logged to Kafka queue; notifications suppressed; no user-facing impact |
+| Community library fallback (Phase 3) | `disable_community_library_context` | `outcome = deleted` rate for Free users increases >10% vs. Phase 2 baseline | Free users without custom library get generic generation (pre-Phase 3 behaviour) |
+
+---
+
+### Level 3: Per-org kill switch
+
+**Flag:** `org_library_injection_enabled` (per org, default: true for qualifying orgs)
+
+**Who can trigger:** Org admin via AI settings page (self-service). Engineering on-call for forced disable during incident.
+
+**Trigger conditions:**
+- Org admin reports generation quality regression or privacy concern
+- >3 beta orgs report the same regression category in Phase 1 (triggers pause of all beta orgs)
+- Engineering on-call identifies a library conflict specific to one org's library structure
+
+**Effect:** Generation for that org falls back to generic output. All other orgs unaffected.
+
+**Recovery:** Org admin re-enables via settings, or engineering re-enables after issue resolution.
+
+---
+
+## 7) System layers
 
 ### Layer 1: Library Index Service
 
@@ -286,7 +358,7 @@ for type in manifest:
   take top 2 per type
 ```
 
-The result is a `library_context` payload (see Section 7 for schema) bounded at ~8,000 tokens, covering the components most relevant to the specific prompt.
+The result is a `library_context` payload (see Section 9 for schema) bounded at ~8,000 tokens, covering the components most relevant to the specific prompt.
 
 **Caching:**
 - Cache key: `hash(org_id + library_version + component_type_manifest)`.
@@ -449,7 +521,7 @@ non_compliant_list = [
 
 ---
 
-## 6) API contracts
+## 8) API contracts
 
 ### POST /ai/generate
 
@@ -633,7 +705,7 @@ Response 206 (partial - suggestion engine timed out):
 
 ---
 
-## 7) Core data model
+## 9) Core data model
 
 ### LibraryComponent
 
@@ -725,7 +797,7 @@ degraded                  boolean     // true if suggestion engine timed out
 
 ---
 
-## 8) Architectural observability schema
+## 10) Architectural observability schema
 
 These are service-level instrumentation events emitted by each layer for ops dashboards and alerting - distinct from the product analytics events in the PRD.
 
@@ -825,7 +897,7 @@ Emitted by the Compliance Computation Service.
 
 ---
 
-## 9) Competitive architecture analysis
+## 11) Competitive architecture analysis
 
 ### How competitors approach design-system-aware generation
 
@@ -854,7 +926,7 @@ Emitted by the Compliance Computation Service.
 
 ---
 
-## 10) Scaling model
+## 12) Scaling model
 
 ### Concurrency and throughput
 
@@ -888,80 +960,256 @@ Emitted by the Compliance Computation Service.
 
 ---
 
-## 11) Data flow - happy path
+## 13) Experiment backlog (architecture instrumentation requirements)
 
-```
-1. Designer submits prompt in Make Designs panel
-   -> POST /ai/generate {org_id, file_id, prompt}
-
-2. Context Injection Service checks cache
-   -> cache miss: run two-pass assembly (type manifest + targeted library fetch)
-   -> cache hit: return cached library_context (P50 latency <300ms)
-
-3. library_context payload assembled (<8,000 tokens)
-
-4. Design-Aware Generation Pipeline receives (prompt + library_context)
-   -> generates frame_spec JSON with component_ids, variable references, text_style references
-
-5. Compliance Computation Service scores frame_spec
-   -> produces compliance_report within 500ms
-
-6. Canvas client receives frame_spec + compliance_report
-   -> translates component_ids to real Figma component instances
-   -> renders frame on canvas
-   -> displays compliance panel with scores and non-compliant elements list
-
-7. Designer reviews panel, replaces any flagged elements, accepts frame
-
-8. Events fire:
-   ai_make_designs_generated (uses_org_library_components: true, outcome: edited)
-   compliance_panel_viewed
-   [if applicable] library_gap_detected per non-compliant element type
-```
-
-**Total latency budget:**
-
-| Step | P50 target | P95 target |
-|---|---|---|
-| Context injection (cache hit) | 300ms | 800ms |
-| Context injection (cache miss) | 600ms | 1,200ms |
-| Frame generation (LLM) | 3,000ms | 6,000ms |
-| Compliance computation | 100ms | 500ms |
-| Canvas rendering | 200ms | 500ms |
-| **End-to-end (cache hit)** | **~4,000ms** | **<8,000ms** |
-| **End-to-end (cache miss)** | **~5,000ms** | **<10,000ms** |
+Each PRD experiment requires specific instrumentation from the architecture layer. This section specifies what the system must emit for each experiment to be measurable.
 
 ---
 
-## 12) Key trade-offs
+### Experiment 1: Compliance panel - default visible vs. opt-in
 
-### Two-pass vs. single-pass generation
+**PRD hypothesis:** Designers who see the compliance panel by default make better decisions and produce higher `component_coverage_pct` in accepted frames.
 
-**Two-pass** (type manifest extraction -> targeted library fetch -> generation) adds ~200ms latency but produces dramatically better component specificity. The manifest step lets the system fetch only the components the prompt actually needs, staying within the token budget without relevance ranking over the entire library.
+**Architecture requirements:**
+- `compliance_panel_viewed` event must include `panel_was_default_open: boolean` field (set by the feature flag that controls the experiment arm).
+- `ai_make_designs_generated` event must include `experiment_arm: "panel_default_open | panel_opt_in"` field.
+- The experiment assignment must be sticky per `org_id` (not per user) to avoid contamination across users in the same org seeing different panel behaviours.
 
-**Single-pass** (embed prompt -> top-N library components by cosine similarity -> generation) is simpler but degrades for prompts where the UI element types are described implicitly ("settings page for notification preferences") rather than explicitly ("page with toggles and a save button"). The semantic similarity between "notification preferences" and "Toggle" is lower than expected.
+**Minimum detectable effect:** 5 percentage points in `component_coverage_pct` mean. Required sample: ~1,200 sessions per arm (assuming 80% power, alpha=0.05, estimated SD of 18 p.p.). At 8,000 library-grounded sessions/day * 50% in experiment * 50% per arm = 2,000 sessions/day per arm. Duration: 4 weeks to reach significance with buffer for day-of-week variance.
 
-Decision: Two-pass for v1. Monitor manifest extraction accuracy - if the classifier misses element types in >10% of sessions, add a single-pass fallback.
-
-### Strict component matching vs. best-effort matching
-
-**Strict:** The generation model must use an exact library component for every element. If no match exists, the element is placed as `library_gap` and flagged. This produces cleaner output but more visible warnings for libraries with coverage gaps.
-
-**Best-effort:** The model uses the nearest library component even if the semantic match is weak (e.g., using a `Card/content` component as a table container because no `Table` exists). This reduces gap warnings but at the cost of producing system-compliant-looking frames that are semantically wrong - engineers may trust them and build from incorrect specs.
-
-Decision: Strict matching. The compliance panel is the user's signal for gaps; best-effort matching would produce false confidence. Design systems teams should fix the library, not accept wrong component substitutions.
-
-### Cache invalidation on library publish vs. real-time library reads
-
-**Cache:** Library context cached for 10 minutes per org library version. A designer who publishes a new component and immediately generates a frame using it will hit the old cache for up to 10 minutes.
-
-**Real-time:** Every generation session fetches the live library. Zero stale cache risk, but eliminates the primary latency and cost lever.
-
-Decision: Cache with 10-minute TTL. Real-time reads add 600-800ms to every cache-miss path and are unnecessary for the vast majority of sessions where the library has not changed since the last fetch. The 10-minute window is short enough that designers who publish a new component can trigger a new generation session after a brief wait without losing trust in the system.
+**Kill condition:** If `outcome = deleted` rate in treatment (panel default open) exceeds control by >10% relative after 7 days, kill the treatment arm and revert to opt-in default.
 
 ---
 
-## 13) Circuit breaker design
+### Experiment 2: Library gap digest - real-time notification vs. weekly summary
+
+**PRD hypothesis:** Real-time Tier 1 notifications shorten time-from-gap-detected to new component published.
+
+**Architecture requirements:**
+- `library_gap_notification_sent` event with fields: `org_id`, `notification_tier: "tier1_realtime | tier2_weekly"`, `missing_element_type`, `gap_count_at_send`, `experiment_arm`.
+- `library_published` events must be joinable to `library_gap_detected` events within the analytics pipeline: identify when a new component matching a previously detected gap type is published. This requires the Library Index Service to log `new_component_types` in the `library_index_updated` event.
+- Experiment assignment at `org_id` level (the unit of analysis is the design systems team, not the individual user).
+
+**Minimum detectable effect:** 7-day reduction in time-to-component. Based on sprint cycle (14 days), the experiment must detect a difference of at least 7 days. Required observation window: 8 weeks (to observe multiple gap-to-publish cycles per org).
+
+**Confound to control:** Orgs with faster library publishing cadence will naturally show faster time-to-component regardless of notification type. Stratify by library publishing frequency (active: >2 publishes/week; moderate: 1-2/week; slow: <1/week) in the analysis.
+
+---
+
+### Experiment 3: Compliance gate - hard gate vs. soft warning for low-coverage frames
+
+**PRD hypothesis:** A soft "Low coverage" badge on frames with <50% component coverage reduces non-compliant frames handed off to engineering.
+
+**Architecture requirements:**
+- `compliance_report` must include a `coverage_gate_triggered: boolean` field (true when `component_coverage_pct` < 50%).
+- `devmode_session_started_on_ai_frame` event: emitted when a Dev Mode user opens an AI-generated frame for engineering inspection. Must include `frame_session_id` to join back to the generation session and its compliance report.
+- `low_coverage_badge_dismissed` event: emitted when a designer explicitly dismisses the badge (if the treatment arm shows the badge).
+- Experiment arm assignment: sticky per `org_id`.
+
+**Minimum detectable effect:** 10 percentage point reduction in low-coverage frame handoff rate (frames with <50% coverage that subsequently receive a `devmode_session_started_on_ai_frame` event). Required sample: orgs producing at least 5 low-coverage frames per week. Likely a small cohort in Phase 2 - may need to extend to Phase 3 population for sufficient power.
+
+---
+
+### Experiment 4: Prompt pre-flight - component type manifest preview before generation
+
+**PRD hypothesis:** A 2-second "planning" step displaying which component types the AI will use increases `outcome = accepted` rate by reducing post-generation surprise.
+
+**Architecture requirements:**
+- `prompt_preflight_shown` event: emitted when the pre-flight manifest preview is displayed to the designer. Fields: `session_id`, `manifest_types: string[]`, `designer_cancelled: boolean`.
+- If the designer cancels at the pre-flight step, no `ai_make_designs_generated` event should fire for that attempt - but a `make_designs_cancelled_at_preflight` event must fire for funnel analysis.
+- The manifest extraction step (Pass 1 of Context Injection) must run in <100ms to keep the pre-flight visible step under the 2-second target. P95 latency for manifest extraction must be monitored independently from context assembly total latency.
+- `experiment_arm: "preflight_shown | no_preflight"` must be included in `ai_make_designs_generated` events.
+
+**Minimum detectable effect:** 5 percentage point increase in `outcome = accepted` rate. Required sample: ~2,400 sessions per arm (assuming current accepted rate ~30%, SD ~0.46, 80% power). At 2,000 sessions/day per arm, duration: ~3 weeks. Pre-flight cancellation rate is a secondary metric: if >20% of sessions are cancelled at pre-flight, the feature is introducing friction, not reducing it.
+
+---
+
+### Experiment 5: Variant confidence labelling in the compliance panel
+
+**PRD hypothesis:** Showing per-variant confidence scores in the compliance panel causes designers to fix more variant mismatches before handoff.
+
+**Architecture requirements:**
+- Compliance Computation Service must be extended to compute a `variant_confidence_score: float` for each `component_instance` element in the frame spec. This score reflects how confident the generation model was in the variant selection (proxy: cosine similarity between the prompt's embedding and the selected variant's semantic label embedding, normalized 0-1).
+- `compliance_panel_variant_swap_clicked` event: emitted when a designer clicks "swap variant" for an amber-highlighted (confidence <70%) component instance. Fields: `session_id`, `element_id`, `original_variant`, `selected_variant`, `original_confidence_score`.
+- `variant_swapped_immediately` event: emitted when a designer swaps a variant within 60 seconds of accepting a library-grounded frame. Fields: `session_id`, `element_id`, `time_since_accept_seconds`. This is the primary proxy for incorrect variant selection.
+- The confidence score computation adds an estimated 50-100ms to compliance computation P95. Verify that the updated P95 stays within the 500ms SLO before enabling in production.
+
+**Minimum detectable effect:** 5 percentage point reduction in `variant_swapped_immediately` rate. Current estimated baseline: 15% (from Phase 1 dogfood data). Required sample: ~3,000 sessions per arm. Duration: 4 weeks.
+
+---
+
+## 14) Phased rollout plan (architecture perspective)
+
+The PRD defines product go/no-go gates per phase. This section defines the architectural milestones and infrastructure prerequisites for each phase.
+
+### Phase 0: Internal dogfood (weeks 1-4)
+
+**Infrastructure prerequisites:**
+- Library Index Service deployed to staging; load tested at 2x dogfood volume.
+- Context Injection Service deployed with Redis cache layer; cache invalidation on `library_published` verified via integration test.
+- Feature flag `global_library_context_injection_enabled` in place; per-org flag wired to flag service.
+- All 4 generation events (`ai_make_designs_generated` additions, `compliance_panel_viewed`, `non_compliant_element_replaced`, `library_gap_detected`) emitting to internal analytics pipeline.
+- PagerDuty alerts configured for `library_context_injection_failure_rate` (>1% warn, >2% critical) and `generation_latency_ms` P95 (>12s warn, >15s critical).
+- Privacy: library context session TTL enforcement verified - zero persistence after session end. Must pass security audit before any generation session uses real org library data.
+
+**Architecture gate to advance to Phase 1:**
+- Library Index Service: P95 latency for `library_published` -> `index_updated` < 5 minutes across 100+ dogfood re-index events.
+- Context Injection Service: P95 latency <800ms; Redis cache hit rate >70% after first 48 hours of dogfood.
+- Zero P0 incidents (privacy data leakage, incorrect library applied to wrong org, generation pipeline returning non-200 for >5% of sessions).
+- `component_coverage_pct` mean >70% across dogfood sessions (measured from `ai_make_designs_generated` events).
+
+---
+
+### Phase 1: Closed beta - 10-15 enterprise orgs (weeks 5-10)
+
+**Infrastructure additions vs. Phase 0:**
+- Embedding pipeline scaled to handle 500+ component org re-indexes within the 5-minute SLO.
+- Dedicated pgvector shards provisioned for any beta org with >500 components.
+- Library gap pipeline: `library_gap_detected` events flowing to Kafka; Tier 1/Tier 2 notification routing logic deployed (needed for Experiment 2).
+- Per-org monitoring dashboards: each beta org gets a dedicated view of their `component_coverage_pct`, `variant_swapped_immediately` rate, and `library_gap_detected` volume. This supports the in-person qualitative review cadence with design systems leads.
+- `library_scope_conflict` event logging in place for multi-library orgs.
+
+**Architecture gate to advance to Phase 2:**
+- Experiment 2 instrumentation validated: `library_gap_notification_sent` events emitting correctly; `library_published` events joinable to gap events in analytics pipeline.
+- P95 generation latency for orgs with 200-400 component libraries: <12s (separate SLO from standard orgs).
+- No regression in `ai_make_designs_generated` volume for beta orgs (generation attempts must not decline >10% post-feature enable).
+- Circuit breaker states monitored and never stuck in OPEN for >15 minutes during Phase 1 window.
+
+---
+
+### Phase 2: Opt-in GA - all Professional+ orgs with published libraries (weeks 11-16)
+
+**Infrastructure additions vs. Phase 1:**
+- Context Injection Service: horizontal scaling validated for 10x Phase 1 volume. Load test at 5x current peak before Phase 2 launch.
+- Redis cache: cross-region replication enabled (US-East, EU-West, AP-Southeast). Each region serves its local Figma canvas clients. Cache invalidation on `library_published` must propagate to all regions within 30 seconds.
+- Library Index Service: read replicas in each region; writes to primary only; replicas used for vector search in non-primary regions.
+- Experiment 1 and Experiment 4 instrumentation deployed and validated in staging before Phase 2 launch.
+- Org admin self-service flag in AI settings page: `library_injection_enabled` toggle per org. Toggle state change fires `org_library_injection_toggled` event for audit log.
+- Privacy disclosure: `library context handling` section added to Figma's product privacy page and linked from the AI settings panel.
+
+**Capacity plan for Phase 2 GA:**
+- Estimated qualifying orgs: ~50,000 Professional and Organisation tier orgs with at least one published library.
+- Estimated opt-in rate: 30% in first 4 weeks = ~15,000 active orgs.
+- Estimated sessions/day at 30% opt-in: 8,000 (current Phase 1 extrapolated) -> scale to handle 25,000 sessions/day by end of Phase 2.
+- Redis cache sizing: 25,000 sessions/day * 10KB payload * 10-min TTL overlap = ~1.7GB hot cache per region. Provision 4GB per region with 2x headroom.
+
+**Architecture gate to advance to Phase 3:**
+- `library_context_injection_failure_rate` sustained <0.5% for 30 days.
+- Generation latency P95 <10s for standard orgs at Phase 2 volume (not just dogfood volume).
+- Privacy: no library context retention incidents in Phase 2.
+- Experiment 1 results available: compliance panel default state confirmed for Phase 3.
+
+---
+
+### Phase 3: Default-on GA - all tiers including community libraries (week 17+)
+
+**Infrastructure additions vs. Phase 2:**
+- Community library indexing: Figma Material Design and iOS Design System component libraries indexed as shared community library contexts. These are static (versioned by Figma's own design team) rather than org-specific. Indexed once per community library version; shared across all Free user sessions that have no custom library.
+- Community library cache: single Redis key per community library version; TTL 24 hours (community libraries change rarely vs. org libraries). Cache invalidation triggered by community library version update event.
+- `library_type: "org | team | community"` field added to all generation events for segmentation.
+- `ai_used_components` provenance panel: Figma canvas client shows which library was used (org, team, or community) inline in the accepted frame. This requires the `library_file_id` and `library_type` from the generation response to be passed to the canvas rendering layer.
+- Experiment 5 instrumentation: variant confidence scoring deployed to Compliance Computation Service. P95 latency re-validated with confidence scoring enabled.
+- Phase 3-specific kill switch: `disable_community_library_context` flag independent from org library injection.
+
+---
+
+## 15) Multi-region deployment design (GDPR)
+
+**Problem:** For EU-resident orgs with data residency requirements, the `frame_spec` returned by the generation pipeline may contain text overrides that include PII (e.g., a designer prompts "User profile page for Jane Doe" - the generated frame's text nodes contain the name). If compliance computation runs in a US-hosted service, this data crosses jurisdictions.
+
+**Decision (from resolved Q6):** Compliance computation must run in the same region as the generation pipeline for each session. Library Index Service and Context Injection Service follow the same regional routing.
+
+**Architecture:**
+
+```
+EU-West region:
+  - Library Index Service replica (Postgres + pgvector)
+  - Context Injection Service instance with EU Redis cache
+  - Generation Pipeline (LLM API calls routed to EU-hosted model endpoints)
+  - Compliance Computation Service
+
+US-East region (primary):
+  - All services (primary)
+
+AP-Southeast region:
+  - Library Index Service replica
+  - Context Injection Service with AP Redis cache
+  - Generation Pipeline (US-West or AP model endpoints by latency)
+  - Compliance Computation Service
+```
+
+**Library data replication:**
+- Library Index Service: primary Postgres in US-East. Replicas in EU-West and AP-Southeast.
+- Replication lag target: <60 seconds. For EU orgs, vector searches run against the EU replica. A replica lag of <60 seconds means a org library publish will be reflected in EU generation sessions within 1 minute.
+- pgvector shards for large orgs (>500 components): provisioned in the org's home region (determined by the org's Figma account region setting). Cross-region shard access is avoided.
+
+**Frame spec data:** The `frame_spec` and `compliance_report` are in-memory only within the generation pipeline. They are not written to persistent storage (only the `session_id` and aggregate metrics are persisted in the `GenerationSession` and `ComplianceReport` tables). This means GDPR deletion requests for session data are handled by deleting the session record; no frame_spec content needs to be scrubbed.
+
+---
+
+## 16) Embedding model migration strategy
+
+**Problem (from resolved Q7):** When OpenAI releases a new version of `text-embedding-3-small`, all org library embeddings become stale relative to the new model's embedding space. Cosine similarity comparisons between old-model query embeddings and new-model stored embeddings will produce incorrect rankings.
+
+**Scale of the problem:** At Phase 3 GA, estimated ~50,000 orgs with published libraries, average 150 components = 7.5M embeddings to re-compute. At 50 embeddings/batch = 150,000 API calls. At $0.00002 per 1K tokens * 50 tokens/component = ~$150 total re-index cost. Cost is not the constraint; latency is - 150,000 API calls at 4 concurrent batches per org would take ~10 hours for a single-threaded migration.
+
+**Migration strategy:**
+
+```
+Phase A - Preparation (before new model goes live):
+  - Freeze current embedding model version in all generation pipeline calls.
+    New library publishes continue using the old model until migration completes.
+  - Provision a migration job queue with org_id entries ordered by org tier:
+    Enterprise -> Organisation -> Professional -> Free community libraries.
+  - Scale embedding worker to 32 concurrent batches (4x normal).
+
+Phase B - Background migration (2-3 days):
+  - Migration job processes orgs from the queue.
+  - For each org: re-embed all components using new model; write new embeddings to
+    a versioned pgvector table (embedding_model_version field).
+  - CIS reads from old embedding table until org migration is confirmed complete.
+  - On completion, CIS switches to new embedding table for that org.
+  - Zero downtime: old and new embedding tables coexist during migration.
+
+Phase C - Cutover:
+  - After all orgs migrated, disable old embedding table reads.
+  - Update embedding model version in library index worker config.
+  - New library publishes use the new model from this point forward.
+
+Phase D - Validation:
+  - Monitor `component_coverage_pct` mean for 7 days post-migration.
+  - If coverage drops >5 p.p. vs. pre-migration baseline, the new model is producing
+    worse relevance rankings for Figma's component vocabulary.
+    Fallback: revert CIS to old embedding table; investigate model compatibility.
+```
+
+**Monitoring during migration:**
+- `embedding_migration_progress` event: emitted per org on completion. Fields: `org_id`, `component_count`, `migration_latency_ms`, `new_model_version`.
+- Dashboard: tracks migration completion rate by org tier; ETA to full migration.
+- Alert: if migration throughput drops below 10,000 components/hour, scale embedding worker.
+
+---
+
+## 17) Failure modes
+
+| Failure | Detection | Mitigation | Degraded state |
+|---|---|---|---|
+| Library Index Service unavailable | Health check failure; `library_context_injection_failure_rate` spike | Circuit breaker trips; fall back to generic generation; `library_context_injected = false` in event | Designer sees generic (non-library) Make Designs output; no error shown |
+| Context injection latency exceeds 1.5s | P95 latency alert; circuit breaker OPEN | Serve partial library context (top 30 components by usage frequency only, skipping two-pass assembly) | Lower coverage quality; generation proceeds |
+| Component type manifest classifier fails (returns empty manifest) | `manifest_extraction_failure` event | Fall back to single-pass: embed prompt, return top 40 components by cosine similarity | Slightly lower component coverage; no user-visible error |
+| Generation model returns malformed frame_spec | JSON parse failure | Retry once with explicit JSON schema hint in prompt; if second attempt fails, fall back to generic generation | Rare; user sees standard "Try again" prompt |
+| Compliance Computation Service exceeds 500ms | P95 alert; circuit breaker OPEN | Return 206 partial (coverage scores only; no non-compliant element list) | Panel shows coverage percentages only; no suggested replacements |
+| Library gap pipeline event backlog | Consumer lag > 1 min | Scale consumer horizontally; Tier 1 notifications degrade to Tier 2 during backlog recovery | Notification delay; no user-facing impact |
+| Multi-library conflict (org has two published org-scoped libraries) | `library_scope_conflict` event logged | Enforce priority: most recently published org library wins; log which library was used per session | Predictable behaviour; design systems lead can inspect via audit log |
+| pgvector shard unavailable for large org | Query timeout; error logged | Route to a read replica; if replica also unavailable, serve from usage-frequency-only fallback (no embedding search) | Lower context relevance; generation proceeds |
+| Embedding pipeline backlog > 500 items | Queue depth alert | Scale embedding worker to 8 replicas; new library publishes processed within 30 min instead of 5 | Stale embeddings for recently published libraries; coverage quality slightly lower |
+| Redis cache unavailable | Connection errors from CIS | Bypass cache; all requests run full two-pass assembly | P95 latency increases to ~1,200ms; no functional degradation |
+| EU replica replication lag > 5 min | Replication lag alert | Block EU org generation sessions from using stale replica; route to primary (US-East) with a user-visible warning "Design system may not reflect recent changes" | Minor latency increase for EU orgs; GDPR compliance maintained |
+| Embedding model migration failure for an org | `embedding_migration_progress` event not received within 2x expected window | Keep org on old embedding table; retry migration job; alert engineering | Old embeddings used; coverage quality unchanged from pre-migration |
+
+---
+
+## 18) Circuit breaker design
 
 Each inter-service call has an independent circuit breaker to prevent cascading failures.
 
@@ -1003,24 +1251,7 @@ The generation pipeline itself is not a circuit breaker target - it uses explici
 
 ---
 
-## 14) Failure modes
-
-| Failure | Detection | Mitigation | Degraded state |
-|---|---|---|---|
-| Library Index Service unavailable | Health check failure; `library_context_injection_failure_rate` spike | Circuit breaker trips; fall back to generic generation; `library_context_injected = false` in event | Designer sees generic (non-library) Make Designs output; no error shown |
-| Context injection latency exceeds 1.5s | P95 latency alert; circuit breaker OPEN | Serve partial library context (top 30 components by usage frequency only, skipping two-pass assembly) | Lower coverage quality; generation proceeds |
-| Component type manifest classifier fails (returns empty manifest) | `manifest_extraction_failure` event | Fall back to single-pass: embed prompt, return top 40 components by cosine similarity | Slightly lower component coverage; no user-visible error |
-| Generation model returns malformed frame_spec | JSON parse failure | Retry once with explicit JSON schema hint in prompt; if second attempt fails, fall back to generic generation | Rare; user sees standard "Try again" prompt |
-| Compliance Computation Service exceeds 500ms | P95 alert; circuit breaker OPEN | Return 206 partial (coverage scores only; no non-compliant element list) | Panel shows coverage percentages only; no suggested replacements |
-| Library gap pipeline event backlog | Consumer lag > 1 min | Scale consumer horizontally; Tier 1 notifications degrade to Tier 2 during backlog recovery | Notification delay; no user-facing impact |
-| Multi-library conflict (org has two published org-scoped libraries) | `library_scope_conflict` event logged | Enforce priority: most recently published org library wins; log which library was used per session | Predictable behaviour; design systems lead can inspect via audit log |
-| pgvector shard unavailable for large org | Query timeout; error logged | Route to a read replica; if replica also unavailable, serve from usage-frequency-only fallback (no embedding search) | Lower context relevance; generation proceeds |
-| Embedding pipeline backlog > 500 items | Queue depth alert | Scale embedding worker to 8 replicas; new library publishes processed within 30 min instead of 5 | Stale embeddings for recently published libraries; coverage quality slightly lower |
-| Redis cache unavailable | Connection errors from CIS | Bypass cache; all requests run full two-pass assembly | P95 latency increases to ~1,200ms; no functional degradation |
-
----
-
-## 15) User journeys (architecture perspective)
+## 19) User journeys (architecture perspective)
 
 ### Journey 1: Designer generates a settings page (happy path)
 
@@ -1044,7 +1275,7 @@ The generation pipeline itself is not a circuit breaker target - it uses explici
 
 **Trade-off accepted:** The 10-minute window is a deliberate cost/accuracy trade-off. Reducing the TTL to 1 minute would eliminate this gap but increase library fetches by 10x. This scenario requires a design systems lead to publish a component and a designer to immediately generate a frame using that exact new component type - a low-frequency event.
 
-### Journey 3: Org with no published library (Free/Professional tier without org-scoped library)
+### Journey 3: Org with no published library
 
 1. Generation session fires. Context Injection Service checks for published org-scoped library - none found.
 2. `library_context_injected = false`. Generation proceeds with the existing generic Make Designs pipeline.
@@ -1052,7 +1283,7 @@ The generation pipeline itself is not a circuit breaker target - it uses explici
 4. `ai_make_designs_generated` event fires with `library_context_injected: false`, `uses_org_library_components: false`.
 5. No user-visible change from current product behaviour.
 
-### Journey 4: Context Injection Service circuit breaker open during generation
+### Journey 4: Context Injection Service circuit breaker open
 
 1. Library Index Service experiences a database failover. CIS P95 latency spikes to 2,000ms. Circuit breaker trips to OPEN state.
 2. Designer submits a prompt. CIS circuit breaker returns partial context (top-40 by usage frequency) in <200ms.
@@ -1064,21 +1295,111 @@ The generation pipeline itself is not a circuit breaker target - it uses explici
 
 ---
 
-## 16) Open questions
+## 20) Open questions - resolved (v3)
 
-1. **Manifest classifier training data:** The two-pass approach relies on a classifier that maps prompt text to UI component types. What training corpus is used? Figma likely has access to anonymised Make Designs prompt logs (with opt-in) that can provide ground truth, but this needs explicit data governance approval before training can begin.
+**Q1: Manifest classifier training data**
 
-2. **Code Connect linkage in generation:** Dev Mode's Code Connect links Figma components to their Storybook/codebase counterparts. Should AI-generated component instances automatically carry Code Connect metadata? This would make generated frames immediately engineer-ready - but it requires the generation pipeline to know which components have active Code Connect links, adding a dependency on the Dev Mode infrastructure team.
+Decision: Two data sources, sequenced.
 
-3. **Cross-file local component handling:** A file may have locally defined components (not from a published library) that the designer regularly uses. Should local components be included in the library context? Including them increases coverage but creates privacy complexity (local components may include draft patterns not ready for AI use). Recommendation: exclude local components in v1; add as opt-in toggle in v2.
+- **Phase 0 bootstrap:** Use Figma's existing anonymised Make Designs prompt logs (sessions where the prompt and accepted frame are both available, with explicit user consent via Figma's AI training opt-in). Extract (prompt text, UI element types present in the accepted frame) pairs as training labels. Estimated corpus: 50,000 sessions with opt-in - sufficient for a baseline classifier.
+- **Phase 1+ refinement:** Collect labels via the prompt pre-flight step (Experiment 4). Each pre-flight display gives the designer an opportunity to confirm or edit the manifest preview. Confirmed manifests are positive labels; edited manifests are correction labels. This creates a continuous training signal without requiring a separate labelling effort.
+- **Data governance gate:** Training must not begin until the privacy team confirms that the training corpus is covered by the existing AI training opt-in language in Figma's terms of service. If not covered, extend the opt-in scope before Phase 0 training runs.
 
-4. **Variable mode context (light/dark theme):** The library context includes both `value_light` and `value_dark` for each color variable. Should the generation pipeline be aware of the file's current variable mode (light/dark/system)? If a file is set to dark mode and the compliance panel checks only dark mode variable references, coverage scores will differ from a file in light mode. Not a blocking question for v1 - default to checking against the active mode.
+---
 
-5. **Variant selection confidence thresholds:** The compliance panel in v2 will show a confidence score per variant selection. What is the minimum threshold below which a variant selection is flagged as low-confidence? This requires a calibration dataset (human-labelled correct/incorrect variant selections) that does not yet exist. Plan: collect labels via the thumbs-up/thumbs-down micro-feedback in Phase 2 rollout (per PRD Q5 resolution) and use them to calibrate in v2.
+**Q2: Code Connect linkage in generation**
 
-6. **Multi-region deployment for compliance computation:** Compliance computation currently runs in the same region as the generation pipeline. For GDPR-compliant orgs (EU data residency), does the compliance computation step need to run in the EU region even if the generation model is US-hosted? The `frame_spec` contains component IDs and text overrides that may reference PII (e.g., a designer using real customer names in a prompt). This needs a privacy review before expanding to EU Enterprise orgs.
+Decision: Add to Phase 2 roadmap, not Phase 0 or Phase 1 scope.
 
-7. **Embedding model versioning:** When OpenAI releases a new version of `text-embedding-3-small`, all org embeddings become stale relative to the new model's embedding space. A full re-index of all org libraries is required. For 50,000 orgs with an average 150-component library, this is 7.5M embedding API calls - a non-trivial operation. A migration strategy (phased re-index by org tier, starting with Enterprise) should be designed before the first embedding model upgrade.
+Rationale: Code Connect linkage requires the generation pipeline to query the Dev Mode infrastructure for each component instance in the frame spec. This adds a dependency on the Dev Mode team's internal APIs and ~100-200ms per session for the linkage lookup. The PRD's Phase 0 latency budget has no headroom for this.
+
+Architecture implication: The `GenerationSession` data model includes a `code_connect_linked: boolean` field (default false) in Phase 0. The canvas client reads this field and shows a "Link to code" prompt in the accepted frame if true. In Phase 2, when the Dev Mode team ships the Code Connect API, the generation pipeline can call it post-compliance-computation and set this field to true for orgs with active Code Connect configurations.
+
+---
+
+**Q3: Cross-file local component handling**
+
+Decision: Exclude local components in Phase 0 and Phase 1. Add as an explicit opt-in in Phase 2.
+
+Rationale: Local components (defined in the current file but not published to a library) present two problems. First, they are not indexed by the Library Index Service (which indexes only published libraries). Adding local component indexing requires a real-time file-read operation at session start, adding ~300-500ms latency. Second, local components frequently include draft patterns that the designer does not want the AI to generalize from.
+
+Phase 2 implementation: The generation panel includes a toggle "Also use components from this file" (default off). When enabled, the Context Injection Service runs a supplemental local component fetch (reading the current file's component set via Figma's internal file API), merges it with the org library context, and passes the combined payload to generation. Local components are tagged `source: "file_local"` in the library context so the Compliance Computation Service can distinguish them from published library components in the coverage report.
+
+---
+
+**Q4: Variable mode context (light/dark theme)**
+
+Decision: Default to the file's active variable mode at session time. Surface the mode used in the compliance panel.
+
+Architecture implementation: The `POST /ai/generate` request is extended with an optional `active_variable_mode: "light | dark | system"` field. If not provided, the API gateway reads the file's current variable mode setting from the Figma file service (cached per file_id, TTL 5 minutes). The compliance computation uses the mode-specific variable values for coverage scoring: if the file is in dark mode, variable coverage is scored against dark mode hex values, not light mode values. The compliance panel shows a small "Scored in dark mode" label when the active mode is not the default light mode.
+
+Edge case: If `active_variable_mode = "system"`, the API gateway defaults to light mode for scoring purposes. A follow-up Phase 2 feature can add dual-mode compliance scoring (show coverage for both light and dark simultaneously).
+
+---
+
+**Q5: Variant selection confidence thresholds**
+
+Decision: Use 70% as the amber threshold for Phase 2 compliance panel labelling. Calibrate from Phase 1 data.
+
+Architecture implementation: The Compliance Computation Service computes `variant_confidence_score` for each `component_instance` element using cosine similarity between the prompt's embedding and the selected variant's semantic label embedding, normalized to a 0-100 scale. In Phase 1 beta, collect `variant_swapped_immediately` data (swaps within 60 seconds of frame acceptance) as ground truth. Calibrate: find the confidence score threshold below which the swap rate exceeds 25%. If that threshold is, say, 65%, then the amber threshold in Phase 2 should be set to 65-70% to surface the right instances.
+
+The 70% default is not arbitrary - it corresponds to cosine similarity ~0.70 in the normalized embedding space, which is the boundary between "semantically similar" and "closely related" in typical text embedding benchmarks. Calibration will tighten or loosen this based on Figma's specific component vocabulary.
+
+---
+
+**Q6: Multi-region deployment for compliance computation (GDPR)**
+
+Decision: Compliance computation runs in the same region as the org's data residency setting. See Section 15 for the full multi-region architecture.
+
+Short answer: EU-resident orgs are identified by their Figma account region (set at org creation and immutable without a data migration). The API gateway routes generation sessions for EU orgs to the EU-West service cluster. All five system layers (LIS, CIS, Generation, CCS, LGP) run in EU-West for these sessions. The `frame_spec` and `compliance_report` never leave the EU-West cluster. Only aggregate metrics (coverage percentages, session counts) are replicated to the US-East analytics pipeline - these do not contain PII.
+
+---
+
+**Q7: Embedding model versioning and re-index migration**
+
+Decision: Maintain a versioned embedding table per org. Run phased migration on new model release. See Section 16 for the full migration strategy.
+
+Short answer: Never run hot-swap migrations. Old and new embedding tables coexist during migration. The Context Injection Service switches to the new table per-org as each org's migration job completes. This prevents any org from experiencing a coverage quality degradation mid-session due to mixed embedding spaces. The cost of the migration ($150 at Phase 3 scale) is negligible compared to the revenue risk of a coverage quality drop affecting enterprise orgs.
+
+---
+
+## 21) Production readiness checklist
+
+This checklist must be signed off before Phase 2 GA launch. Items marked `[blocking]` must be complete; `[non-blocking]` are strongly recommended but do not gate launch.
+
+### Infrastructure
+
+- [ ] Library Index Service: P95 latency for `library_published` -> `index_updated` <5 min verified in production under Phase 1 load `[blocking]`
+- [ ] Context Injection Service: load tested at 3x Phase 1 peak; Redis cache cross-region replication verified `[blocking]`
+- [ ] pgvector shards provisioned for all Phase 1 beta orgs with >500 components `[blocking]`
+- [ ] EU-West service cluster deployed; routing verified for EU-resident orgs `[blocking]`
+- [ ] Global kill switch (`global_library_context_injection_enabled`) tested in production - disable and re-enable without generation errors `[blocking]`
+- [ ] Per-layer kill switches tested individually in staging `[blocking]`
+- [ ] Per-org kill switch wired to org admin AI settings page `[blocking]`
+- [ ] Redis cache: 4GB provisioned per region with 2x headroom for Phase 2 volume `[non-blocking]`
+
+### Observability
+
+- [ ] All 6 architectural observability events emitting to production monitoring pipeline `[blocking]`
+- [ ] Real-time dashboard live: `component_coverage_pct` mean, `outcome = deleted` rate, `library_context_injection_failure_rate`, generation latency P50/P95/P99 `[blocking]`
+- [ ] PagerDuty alerts configured and tested: failure rate, latency, embedding queue depth `[blocking]`
+- [ ] Per-org monitoring dashboards available for Phase 1 beta orgs `[non-blocking]`
+- [ ] Experiment 1 and Experiment 4 instrumentation events emitting and joinable in analytics pipeline `[blocking]`
+
+### Privacy and security
+
+- [ ] Privacy review complete: library context data used only for in-session generation; no retention after session end confirmed via TTL enforcement audit `[blocking]`
+- [ ] Security audit: library context from Org A cannot be served to Org B under any race condition or cache key collision scenario `[blocking]`
+- [ ] `library_context_handling` section published on Figma's product privacy page `[blocking]`
+- [ ] Org admin consent flow for model training opt-in reviewed by legal `[blocking]`
+- [ ] EU data residency routing audit: no EU org session data transiting US-East services `[blocking]`
+
+### Reliability
+
+- [ ] Circuit breaker states tested under injected failures: LIS down, CIS latency spike, CCS timeout `[blocking]`
+- [ ] Fallback to generic generation verified: zero user-visible errors when any single layer fails `[blocking]`
+- [ ] Embedding pipeline backlog recovery tested: scale from 2 to 8 workers without dropped events `[non-blocking]`
+- [ ] Multi-library conflict resolution verified: correct library selected and logged for orgs with 2+ published org-scoped libraries `[blocking]`
 
 ---
 
