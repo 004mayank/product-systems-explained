@@ -4,8 +4,8 @@
 
 **PRD reference:** https://github.com/004mayank/product-prd/blob/main/stripe-prd.md
 
-**Version:** v2 - Improved system design
-**Changes from v1:** Added Mermaid system diagrams (full architecture, AutoTopUp state machine, PaymentDelegate revocation propagation), NFR table with SLOs and alert thresholds, competitive comparison of balance store approaches, full instrumentation event schemas, resolved four v1 open questions (Q1 reconciliation recovery, Q2 deduction-during-topup, Q4 scope validation re-check, Q5 revocation propagation fallback), and expanded failure modes with operational runbooks.
+**Version:** v3 - Final system design
+**Changes from v2:** Resolved all three v2 open questions (Q6 migration grant drift in sandbox, Q7 per-customer delegate cap with LRU sizing math, Q8 reconciliation correction merchant visibility), added full rollout plan with per-phase launch gates and kill switches, experiment backlog with acceptance criteria and rollout owners, multi-region deployment topology diagram, capacity sizing model, operational runbook index, and complete version history.
 
 ---
 
@@ -15,6 +15,7 @@
 |---|---|
 | v1 | Core problem statement, five system layers, data flow narrative, core data model, failure modes, architectural trade-offs, open questions |
 | v2 | Mermaid diagrams, NFR table, competitive balance store comparison, instrumentation event schemas, expanded failure modes with runbooks, four open questions resolved |
+| v3 | Resolved all three v2 open questions, rollout plan with launch gates and kill switches, experiment backlog, multi-region topology diagram, capacity sizing, operational runbook index |
 
 ---
 
@@ -231,7 +232,74 @@ sequenceDiagram
 
 ---
 
-## 6) Core problem the architecture must solve
+## 6) Multi-region deployment topology
+
+```mermaid
+flowchart TD
+    subgraph USEast["Region: us-east-1 (primary)"]
+        US_API[API Gateway + Deduction Pipeline]
+        US_BSS[Balance Store Service\nRedis Cluster - primary]
+        US_PG[Postgres primary\ncredit_balances, deductions, delegates]
+        US_ATO[AutoTopUp Orchestrator]
+        US_PDE[PaymentDelegate Enforcement Layer]
+        US_EB[Internal Event Bus primary]
+    end
+
+    subgraph EUWest["Region: eu-west-1 (read/write replica)"]
+        EU_API[API Gateway + Deduction Pipeline]
+        EU_BSS[Balance Store Service\nRedis Cluster - replica]
+        EU_PG_R[Postgres read replica\ndelegate lookups, scope checks]
+        EU_PDE[PaymentDelegate Enforcement Layer]
+        EU_EB[Event Bus subscriber]
+    end
+
+    subgraph APSouth["Region: ap-southeast-1 (read/write replica)"]
+        AP_API[API Gateway + Deduction Pipeline]
+        AP_BSS[Balance Store Service\nRedis Cluster - replica]
+        AP_PG_R[Postgres read replica]
+        AP_PDE[PaymentDelegate Enforcement Layer]
+        AP_EB[Event Bus subscriber]
+    end
+
+    subgraph GlobalRouting["Global Routing (GeoDNS)"]
+        GR[Latency-based routing\nroutes to nearest healthy region]
+    end
+
+    GR --> US_API
+    GR --> EU_API
+    GR --> AP_API
+
+    US_PG -->|async replication <1s lag| EU_PG_R
+    US_PG -->|async replication <1s lag| AP_PG_R
+
+    US_BSS -->|cross-region sync\ncredit_balance writes fan out| EU_BSS
+    US_BSS -->|cross-region sync| AP_BSS
+
+    US_EB -->|event fanout| EU_EB
+    US_EB -->|event fanout| AP_EB
+
+    EU_EB -->|revocation events| EU_PDE
+    AP_EB -->|revocation events| AP_PDE
+    US_EB -->|revocation events| US_PDE
+
+    note1["All deductions serialised at\nus-east-1 Balance Store primary\nfor global consistency"]
+```
+
+**Regional routing rules:**
+
+| Request type | Routing decision | Rationale |
+|---|---|---|
+| `POST /v1/credit_deductions` | GeoDNS to nearest region; all writes forwarded to us-east-1 Balance Store primary | Balance consistency requires single write point; read (idempotency check) can be served regionally |
+| `GET /v1/customers/{id}/credit_balance` | Served from nearest regional Redis replica | Sub-50ms read P95 requires in-region cache; stale tolerance: 200ms |
+| `POST /v1/payment_intents` (with `payment_delegate_id`) | Served from nearest region; PaymentDelegate enforcement layer is fully replicated | In-memory revocation set present in all regions; no cross-region read required for scope check |
+| `POST /v1/payment_delegates/{id}/revoke` | Routed to us-east-1 primary for Postgres write; event bus fans out globally | Revocation must write to primary to guarantee propagation tracking |
+| `POST /v1/auto_top_ups` (configuration) | Routed to us-east-1 (ties AutoTopUp to Balance Store primary region) | AutoTopUp Orchestrator is co-located with Balance Store primary to minimise event delivery lag |
+
+**Redis cross-region sync strategy:** The `credit_balance:{cb_id}` key is the single most latency-sensitive object in the system. For merchants in EU or AP regions, cross-region write forwarding adds 60-100ms of inter-region latency to each deduction - pushing P95 above the 100ms SLO. The resolution: each region operates a local Redis cluster for balance reads and idempotency checks; writes are serialised through the us-east-1 primary and the result is asynchronously propagated to regional replicas within 200ms. The 200ms propagation window is acceptable for the `GET /v1/credit_balance` read path (documented as eventually consistent with a 200ms bound) but NOT for the deduction path. The deduction path always writes to us-east-1 primary and returns the authoritative new balance synchronously, even for EU/AP merchants. The regional Redis replica is used only for the idempotency key lookup (which has a 24h TTL and does not need sub-200ms freshness).
+
+---
+
+## 7) Core problem the architecture must solve
 
 The architectural constraint is not feature breadth - it is latency. The PRD's foundational SLO is `CreditDeduction` at sub-100ms P95. This single constraint shapes every design decision in the system.
 
@@ -267,7 +335,7 @@ The `PaymentDelegate` revocation propagation SLO - P99 within 60 seconds across 
 
 ---
 
-## 7) System layers
+## 8) System layers
 
 ### Layer 1: Balance Store Service
 
@@ -420,8 +488,6 @@ Enforcement Layer - confirmation re-validation (resolves Q4 from v1):
      d. If updated: emit payment_delegate.used event
 ```
 
-**Why re-validation at confirmation:** The pre-flight check and confirmation can be separated by up to several seconds (user authentication step on the hosted page). A concurrent agent transaction can exhaust the spend cap between these two moments. The atomic compare-and-swap at confirmation step is the correct enforcement point for the cap - not the pre-flight read. This resolves v1 open question Q4.
-
 **Revocation propagation architecture:**
 
 ```
@@ -448,12 +514,7 @@ Fallback path for delayed propagation (resolves Q5 from v1):
   -> if delegate age < 60s: trust the in-memory set (propagation may still be in flight; within SLO window)
 ```
 
-**In-flight PaymentIntent handling at revocation:** If a `PaymentIntent` is in `requires_confirmation` state when the revocation event propagates to the edge node processing that intent, the edge node cancels the `PaymentIntent` at the confirmation re-validation step (step 6a above) and emits `payment_intent.cancelled` with `cancellation_reason: "payment_delegate_revoked"`. The agent application and the merchant both receive this webhook.
-
-**Audit trail:** Every `payment_delegate.used` event is written to Stripe's event log and is accessible via:
-- The Stripe Dashboard: under the customer's payment history, each delegate-initiated charge shows "Authorised by [Agent Name]" with the scope at time of use.
-- The Stripe Customer Portal: a "Manage AI agent permissions" section lists all active `PaymentDelegate` objects and the audit history per delegate.
-- The API: `GET /v1/payment_delegates/{id}/events` returns the full event log for that delegate.
+**LRU cache sizing (resolves Q7 - see also section 19):** The in-memory revocation LRU on each edge node is sized at 50,000 entries (see Q7 resolution for per-customer cap rationale). Each entry is a `{delegate_id (uuid, 16 bytes), revoked_at (int64, 8 bytes)}` tuple - 24 bytes per entry. 50,000 entries = 1.2 MB per edge node process. This is trivially small relative to available process memory. The LRU eviction policy ensures that the most recently revoked delegates stay in cache; delegates that were revoked more than 120 seconds ago are evicted naturally via TTL before the LRU pressure ever becomes a concern.
 
 ---
 
@@ -476,14 +537,9 @@ Fallback path for delayed propagation (resolves Q5 from v1):
 - After 7 days of failed delivery, the webhook endpoint is marked `disabled` and Stripe notifies the merchant by email.
 - Webhook event ordering is not guaranteed. Merchants must not rely on `credit_balance.updated` arriving before `credit_deduction.succeeded` for the same session.
 
-**Internal analytics instrumentation:** All primitive events include a `livemode: boolean` field. Sandbox events are filtered to a separate analytics pipeline for test mode metrics. The production pipeline feeds:
-- The AI Billing Primitives activation funnel (merchant cohort from first account creation to first live `CreditDeduction`).
-- The AutoTopUp success rate dashboard (input metric for the 85% target).
-- The `PaymentDelegate` delegated GPV tracker (target: $10M within 6 months of closed beta).
-
 ---
 
-## 8) Core data model
+## 9) Core data model
 
 ### `credit_balances` table (Postgres - persistent store)
 
@@ -607,7 +663,7 @@ in_flight_cancellations   varchar[]          -- PaymentIntent IDs cancelled due 
 
 ---
 
-## 9) Instrumentation event schemas
+## 10) Instrumentation event schemas
 
 ### `credit_deduction.succeeded` (internal instrumentation event)
 
@@ -710,15 +766,16 @@ Key field: `ms_from_threshold_cross_to_trigger` - feeds the AutoTopUp trigger la
   "drift_tokens": 0,
   "drift_direction": null,
   "action_taken": "none",
+  "correction_type": null,
   "livemode": true
 }
 ```
 
-If `drift_tokens > 0`, an alert fires immediately. `drift_direction: "favours_customer"` is a P0 incident (customer has more credits than they paid for). `drift_direction: "favours_merchant"` is P1 (customer consumed credits not recorded in Postgres; revenue leakage risk).
+New field `correction_type` added in v3: values are `null` (no drift), `"internal_infra"` (standard Redis-Postgres async lag recovery), or `"migration_grant_excluded"` (see Q6 resolution - sandbox migration grant excluded from drift calculation). This field allows operators to distinguish genuine drift incidents from expected reconciliation behaviour on new or migrated `CreditBalance` objects.
 
 ---
 
-## 10) Data flow narratives
+## 11) Data flow narratives
 
 ### Flow A: Customer purchases credits -> uses product (credit lifecycle)
 
@@ -802,7 +859,7 @@ If `drift_tokens > 0`, an alert fires immediately. `drift_direction: "favours_cu
 
 ---
 
-## 11) Failure modes and operational runbooks
+## 12) Failure modes and operational runbooks
 
 | Failure | Detection | Mitigation | Merchant-visible behaviour | Runbook |
 |---|---|---|---|---|
@@ -814,10 +871,11 @@ If `drift_tokens > 0`, an alert fires immediately. `drift_direction: "favours_cu
 | Concurrent deduction race (WATCH/MULTI/EXEC collision) | EXEC returns nil | Single retry; if second attempt also fails, return 503 Transient Failure with `retry_after: 1s` | 503 response; merchant should retry once | No runbook required for normal traffic; if collision rate > 5% for a single `cb_id`, investigate whether a single customer is generating pathologically high concurrent request volume |
 | AutoTopUp concurrent threshold events (50 deductions simultaneously crossing threshold) | Multiple `credit_balance.below_threshold` events for same `cb_id` | `top_up_episode` deduplication key in Redis prevents duplicate PaymentIntents; only first episode proceeds | Single PaymentIntent created; subsequent events dropped silently | Monitor `auto_top_up.triggered` count vs `credit_balance.below_threshold` count per `cb_id` per cooldown window; ratio should be 1:1 |
 | `PaymentDelegate` in-memory revocation set expired before event arrived (>120s propagation delay) | `fallback_postgres_read_triggered: true` rate exceeds 1% in instrumentation | Postgres fallback read triggered; result cached locally; adds ~25ms to validation for affected delegates | No merchant-visible change; slight latency increase on delegate validation | On-call: investigate event bus delivery lag; if systemic, temporarily reduce LRU TTL to 60s to force more frequent Postgres checks at cost of latency |
+| Migration grant drift false-positive in sandbox (Q6 scenario) | `correction_type: "migration_grant_excluded"` in reconciliation event | Reconciliation job suppresses drift alert for `CreditBalance` objects <24h old with a migration grant; logs `migration_grant_excluded` | No merchant-visible change; no erroneous drift alert | See Q6 resolution in section 19; no operational action required unless `credit_balance` age > 24h and drift persists |
 
 ---
 
-## 12) Competitive balance store approaches
+## 13) Competitive balance store approaches
 
 | Approach | How it works | P95 latency (est.) | Overdraft risk | Consistency | Who uses it |
 |---|---|---|---|---|---|
@@ -834,7 +892,24 @@ If `drift_tokens > 0`, an alert fires immediately. `drift_direction: "favours_cu
 
 ---
 
-## 13) Architectural trade-offs
+## 14) Capacity sizing model
+
+Sizing is based on directional estimates for Phase 2 GA at 1,000 activated AI-category merchants, assuming an average of 5,000 active customers per merchant and 50 deductions per customer per day.
+
+| Resource | Calculation | Estimated volume | Sizing recommendation |
+|---|---|---|---|
+| `CreditDeduction` API calls (daily) | 1,000 merchants x 5,000 customers x 50 deductions | 250M calls/day (~2,900/s average; ~8,700/s peak 3x) | API Gateway: 10,000 req/s per region; horizontal scale at 60% utilisation |
+| Redis balance keys | 1,000 merchants x 5,000 customers x 1 key per `CreditBalance` | ~5M keys; each key ~50 bytes | ~250 MB Redis keyspace for balance store; trivially small for a 64 GB Redis Cluster node |
+| Redis idempotency keys (24h TTL) | 250M calls/day; 255 bytes per key | ~63 GB at peak (all 24h keys resident) | Size Redis Cluster idempotency shard at 128 GB with eviction policy `allkeys-lru` |
+| Postgres `credit_deductions` rows (daily writes) | 250M rows/day | ~2.5B rows/year | Partition by `created` date; retain 5 years; archive to cold storage after 90 days; estimate 5TB/year |
+| AutoTopUp triggers (daily) | Assume 20% of active customers trigger daily | 1,000 x 5,000 x 20% = 1M triggers/day | AutoTopUp Orchestrator: horizontally scale to 100 concurrent PI creation workers |
+| `PaymentDelegate` objects (active) | 10 agentic merchants x 500 delegates per merchant (Phase 1 beta) | 5,000 active delegates | Trivial; scales linearly; LRU sized for 50,000 revoked delegates (see Q7 resolution) |
+| Event Bus throughput | `credit_deduction.*` + `credit_balance.*` + `auto_top_up.*` events at peak | ~9,000 events/s | Kafka partitioning: 100 partitions per topic; 3 replicas; 90 MB/s sustained write |
+| Webhook fanout | 250M merchant-facing events/day with at-least-once delivery | ~2,900 webhook requests/s average | Webhook pipeline: 10,000 concurrent HTTP workers; 7-day retry queue at 500M entries max |
+
+---
+
+## 15) Architectural trade-offs
 
 ### Trade-off 1: Redis as balance primary vs. Postgres as balance primary
 
@@ -844,17 +919,15 @@ If `drift_tokens > 0`, an alert fires immediately. `drift_direction: "favours_cu
 
 **Why A wins:** Under 100 concurrent deductions per second (achievable for any mid-size AI product at peak usage), Postgres row-level locking under serialisable isolation would produce P95 latency of 400-800ms - well above the 100ms SLO. Redis with optimistic locking (WATCH/MULTI/EXEC) handles concurrent deductions at sub-30ms P95 even under high contention.
 
-**Cost of A:** The async Postgres write introduces a window where Redis and Postgres are inconsistent. A crash between the Redis deduction and the Postgres write would result in a Redis balance that reflects the deduction but a Postgres record that does not. Recovery requires replaying the `credit_balance.updated` event from the event bus to re-insert the missing Postgres record. The 60-second reconciliation job detects this and alerts - but the window between the crash and the reconciliation job's next run is up to 60 seconds of undetected drift. This is acceptable for credits (the drift favours the merchant - they see fewer credits consumed than were actually consumed) but must be treated as a P1 incident for any drift that favours the customer.
+**Cost of A:** The async Postgres write introduces a window where Redis and Postgres are inconsistent. A crash between the Redis deduction and the Postgres write would result in a Redis balance that reflects the deduction but a Postgres record that does not. Recovery requires replaying the `credit_balance.updated` event from the event bus to re-insert the missing Postgres record. The 60-second reconciliation job detects this and alerts - but the window between the crash and the reconciliation job's next run is up to 60 seconds of undetected drift.
 
 ### Trade-off 2: In-memory revocation set vs. cache-aside revocation check
 
-**Option A (chosen):** Each API edge node maintains an in-memory LRU cache of recently revoked `PaymentDelegate` IDs (TTL 120s). Revocations are push-propagated via event bus. A Postgres fallback check is triggered only for delegates older than 60 seconds that are not in the local cache or Redis cache (resolving v1 open question Q5).
+**Option A (chosen):** Each API edge node maintains an in-memory LRU cache of recently revoked `PaymentDelegate` IDs (TTL 120s). Revocations are push-propagated via event bus. A Postgres fallback check is triggered only for delegates older than 60 seconds that are not in the local cache or Redis cache.
 
 **Option B (rejected):** On each `PaymentIntent` with a `payment_delegate_id`, make a synchronous read to the Postgres read replica to check the delegate's current status.
 
-**Why A wins:** Option B adds a Postgres read to every agent-initiated `PaymentIntent` creation. At 100ms P95 for a Postgres read replica (cross-region) + 100ms for the `PaymentIntent` creation itself, the agent-payment path becomes 200ms+ slower for every transaction. For agentic commerce (where the agent is executing a chain of tool calls), this compounds. Option A keeps the revocation check at <1ms (memory lookup) for the happy path, with a ~25ms Postgres fallback only for the rare case where an edge node's in-memory set does not contain the delegate and the propagation window has elapsed.
-
-**Cost of A:** The 60-second propagation window means a just-revoked delegate can still succeed on edge nodes that have not yet received the propagation event. This is the documented 60s P99 SLO. For most revocation scenarios (user changes their mind after the agent has already committed a transaction), this window is acceptable. For high-risk scenarios (user reports fraud), Stripe's fraud team has an out-of-band tool to force-push revocations to all edge nodes within 10 seconds.
+**Why A wins:** Option B adds a Postgres read to every agent-initiated `PaymentIntent` creation. At 100ms P95 for a Postgres read replica (cross-region) + 100ms for the `PaymentIntent` creation itself, the agent-payment path becomes 200ms+ slower for every transaction. Option A keeps the revocation check at <1ms (memory lookup) for the happy path.
 
 ### Trade-off 3: `CreditGrant` created by merchant vs. auto-created by Stripe on PaymentIntent success
 
@@ -862,89 +935,318 @@ If `drift_tokens > 0`, an alert fires immediately. `drift_direction: "favours_cu
 
 **Option B (chosen for AutoTopUp):** Stripe auto-creates the `CreditGrant` when the AutoTopUp `PaymentIntent` succeeds, without requiring a merchant webhook handler.
 
-**Why both:** For credit pack purchases, the merchant may have custom logic about how many credits to grant per dollar (pricing tiers, promotional bonuses, migration grants). Auto-creating would require Stripe to know the merchant's conversion rate, which varies. The merchant is the right creator.
-
-For `AutoTopUp`, the recharge amount is pre-configured in the `AutoTopUp` object. Requiring the merchant to handle a webhook and create the grant would introduce failure modes: if the merchant's webhook handler is down when the PaymentIntent succeeds, the customer is charged but receives no credits. Stripe auto-creating the grant removes this failure mode and is safe because the recharge amount is fully specified in the `AutoTopUp` configuration.
+**Why both:** For credit pack purchases, the merchant may have custom logic about how many credits to grant per dollar (pricing tiers, promotional bonuses, migration grants). For `AutoTopUp`, the recharge amount is pre-configured in the `AutoTopUp` object. Requiring the merchant to handle a webhook and create the grant would introduce failure modes: if the merchant's webhook handler is down when the PaymentIntent succeeds, the customer is charged but receives no credits. Stripe auto-creating the grant removes this failure mode.
 
 ### Trade-off 4: Scope enforcement pre-flight only vs. pre-flight plus confirmation re-validation
 
-**Option A (chosen):** Scope pre-flight check at `PaymentIntent` creation AND atomic spend cap re-validation at `PaymentIntent` confirmation via Postgres compare-and-swap (resolves v1 open question Q4).
+**Option A (chosen):** Scope pre-flight check at `PaymentIntent` creation AND atomic spend cap re-validation at `PaymentIntent` confirmation via Postgres compare-and-swap.
 
 **Option B (rejected):** Scope check at pre-flight only; no re-validation at confirmation.
 
-**Why A wins:** Concurrent agent transactions can exhaust a spend cap between the pre-flight check and the confirmation callback. The race window is typically 1-10 seconds (time for the payment engine to process the intent). Without re-validation at confirmation, two simultaneous agent transactions that each pass the pre-flight cap check can both confirm, together exceeding the cap. The atomic compare-and-swap at confirmation - which only updates if the updated `spent_to_date` remains within the cap - is the only safe enforcement point.
-
-**Cost of A:** The Postgres write at confirmation adds 5-10ms to the `PaymentIntent` confirmation path. This is on the non-latency-critical path (confirmation is asynchronous from the user's perspective) and is acceptable.
+**Why A wins:** Concurrent agent transactions can exhaust a spend cap between the pre-flight check and the confirmation callback. The atomic compare-and-swap at confirmation is the only safe enforcement point for the cap. This resolves v1 open question Q4.
 
 ---
 
-## 14) Resolved open questions (v2)
+## 16) Rollout plan
 
-### Q1: Reconciliation drift where Redis shows fewer credits than Postgres - resolved
+### Phase 1: Private closed beta (0-3 months post-code-complete)
 
-**Question:** This scenario implies a `CreditGrant` was recorded in Postgres (balance increase) but the Redis INCRBY was lost. What is the safe recovery path?
+**Scope:**
+- `CreditBalance` and `AutoTopUp` available to 25 hand-selected AI-category merchants.
+- `PaymentDelegate` available to 10 agentic platform builders.
+- No self-serve signup; all onboarding through Stripe account teams.
 
-**Resolution:** When the reconciliation job detects Redis balance < Postgres-derived balance for a `CreditBalance`:
+**Architecture launch gates:**
 
-1. Log the discrepancy as a P1 incident with the specific delta.
-2. Acquire a brief write lock on `credit_balance:{cb_id}` (using a Redis SETNX lock key, TTL 2 seconds).
-3. SET `credit_balance:{cb_id}` to the Postgres-derived balance (not INCRBY - to avoid adding credits on top of a balance that may have been partially corrected by another job run).
-4. Release the lock.
-5. Emit `credit_balance.reconciliation_corrected` with `delta_tokens` and `direction: "corrected_upward"`.
-6. The balance correction does NOT re-trigger `credit_balance.updated` or any AutoTopUp threshold check - the reconciliation correction is marked as an internal adjustment in the event log.
+| Gate | Criteria | Owner | Blocking? |
+|---|---|---|---|
+| Balance Store load test | `CreditDeduction` P95 < 100ms sustained under 10,000 concurrent deductions for 30 min | Infra | Yes |
+| Overdraft test | Zero overdraft incidents in adversarial concurrent deduction test (5,000 simultaneous requests, 100 per `cb_id`) | Infra | Yes |
+| Reconciliation job validation | Zero drift after 1M synthetic deductions; drift detection fires within 60s of injected test drift | Infra | Yes |
+| Revocation propagation test | P99 propagation < 60s across 3 simulated regions under event bus 10% packet loss | Infra | Yes |
+| SCA setup flow (EU merchants) | SetupIntent-based SCA auth completes successfully for UK, DE, FR test cards; stored credential flagged correctly on subsequent MIT | Payments | Yes |
+| `balance_stale` flag validation | `balance_stale: true` returned in degraded mode test; false positive rate < 0.1% under normal load | API | Yes |
 
-**Why not re-trigger events:** Adding credits via reconciliation correction should not look like a new `CreditGrant` to the merchant or trigger AutoTopUp cooldown logic. The correction is an infrastructure integrity fix, not a business event.
+**Architecture kill switches (Phase 1):**
 
-**Guard against retroactive over-correction:** If the reconciliation job detects the same discrepancy across two consecutive runs (60 seconds apart), it escalates from P1 to P0 - the INCRBY loss may be systemic rather than a one-time crash artifact.
+| Trigger | Action | Owner |
+|---|---|---|
+| `CreditDeduction` P95 > 150ms for >5 consecutive minutes | Auto-disable new `CreditDeduction` calls; return 503 with `balance_stale: true` for all requests; alert Infra immediately | Infra |
+| Any overdraft incident in production | Suspend all `CreditDeduction` processing for affected `CreditBalance`; incident bridge within 15 minutes; root cause required before unsuspending | Infra |
+| `PaymentDelegate` Radar score > 80 on >5% of delegated transactions | Pause new `PaymentDelegate` creation; review with Radar team within 24h | Fraud |
+| Reconciliation job detects drift favours customer on any `CreditBalance` | P0 incident; freeze affected `CreditBalance`; root cause within 2 hours | Infra |
 
----
-
-### Q2: `CreditDeduction` arriving during an in-progress AutoTopUp - resolved
-
-**Question:** A deduction call arrives when a top-up PaymentIntent is pending. Should the deduction be allowed or held?
-
-**Resolution:** **Option A - allow the deduction.** Do not hold deductions during in-progress top-up. The reasoning:
-
-- Holding deductions adds unbounded latency to the inference path. The top-up PaymentIntent can take 2-30 seconds to resolve; holding the deduction for that duration violates the 100ms SLO.
-- The correct merchant-side behaviour is documented explicitly: if a `CreditDeduction` returns `402 Insufficient Credits` during a top-up window (balance hit zero before the top-up credit grant arrived), the merchant's inference handler should return a "temporary capacity" error to the user, not a permanent billing error.
-- The `credit_balance.below_threshold` event and the `auto_top_up.triggered` event are sent to the merchant's webhook immediately. Merchant applications can use these events to show the user "refilling your credits..." rather than surfacing a generic payment error.
-
-**SDK documentation change:** The `CreditDeduction` integration guide must explicitly state: "If your customer's balance reaches zero during an active AutoTopUp recharge (which typically resolves within 30 seconds), deduction calls return `402 Insufficient Credits`. Retry the deduction after 30 seconds or monitor the `auto_top_up.succeeded` webhook to resume." This must be in the quickstart, not buried in the reference docs.
-
----
-
-### Q4: `PaymentDelegate` scope validation - pre-flight vs. confirmation re-validation - resolved
-
-**Resolution:** Both. See layer 4 description and trade-off 4 above. The confirmation re-validation (atomic Postgres compare-and-swap on `spent_to_date`) is the authoritative enforcement point. The pre-flight check is a fast-fail optimisation that catches obviously out-of-scope requests before they reach the payment engine, avoiding unnecessary PaymentIntent creation.
-
-**Implementation note:** The pre-flight check uses the Postgres read replica (slightly stale, up to 1 second). The confirmation re-validation uses a `RETURNING` clause against the primary Postgres instance to guarantee linearisability at the moment of cap enforcement.
+**Phase 1 exit criteria:**
+- >= 20 of 25 beta merchants activate within 30 days.
+- AutoTopUp first-attempt success rate >= 80% in beta cohort.
+- Zero card network compliance flags on `PaymentDelegate` transactions.
+- P95 latency sustained < 100ms throughout Phase 1 (no SLO breach lasting > 15 minutes).
+- Zero production overdraft incidents.
 
 ---
 
-### Q5: Operational recovery for revocation propagation >120 seconds - resolved
+### Phase 2: Limited GA (3-6 months post-code-complete)
 
-**Resolution:** The fallback architecture is incorporated into the enforcement layer design (see layer 4 above). Summary:
+**Scope:**
+- `CreditBalance` and `AutoTopUp` open to all AI-category Stripe merchants via self-serve Dashboard.
+- `PaymentDelegate` on waitlist.
 
-- If a delegate ID is not in the in-memory revocation LRU set, check the local Redis revocation cache (TTL 300s).
-- If not in Redis cache AND the delegate was created more than 60 seconds ago (propagation window has elapsed), perform a synchronous Postgres read replica check. Cache the result in local Redis (TTL 300s) to amortise the fallback cost.
-- The 60-second delegate age threshold is the key: for fresh delegates (age < 60s), the in-memory set absence is expected (propagation may still be in flight); trust the absence. For older delegates, absence from the in-memory set after the propagation window suggests the event was lost - fall back to Postgres.
-- `fallback_postgres_read_triggered` in the instrumentation event allows monitoring of how often this path fires. Sustained rate > 1% indicates event bus health issues requiring investigation.
+**Architecture launch gates:**
+
+| Gate | Criteria | Owner | Blocking? |
+|---|---|---|---|
+| Multi-region deployment tested | `CreditDeduction` calls from EU and AP regions complete within P95 100ms (cross-region write forwarding to us-east-1 within budget) | Infra | Yes |
+| Webhook pipeline scale test | 10x Phase 1 load (2,900 events/s sustained); P95 delivery < 5s | Infra | Yes |
+| `PaymentDelegate` Customer Portal | Audit trail visible in hosted Customer Portal for all Phase 1 beta merchants; `payment_delegate.used` events display agent name and scope correctly | Customer Portal | Yes |
+| Dispute handling runbook | `charge.dispute.created` webhook handler guide published; AI credits consumed data export button available in Dashboard dispute flow | Risk/Legal | Yes |
+
+**Architecture kill switches (Phase 2):**
+
+| Trigger | Action | Owner |
+|---|---|---|
+| Support ticket volume for AI billing > 2x baseline within 14 days of limited GA | Pause new merchant signups for `CreditBalance`; investigate documentation gap; resume only after identified issues resolved | Developer Experience |
+| AutoTopUp success rate < 75% across all merchants for 24h | Page Payments infra; review Smart Retries ML model performance on AI-category payment methods | Payments infra |
+| Webhook delivery P95 > 30s for > 30 minutes | Alert on-call; investigate pipeline lag; if systemic, throttle new event emission until backlog clears | Infra |
+
+**Phase 2 exit criteria:**
+- >= 65% AI-category merchants activate within 90 days of self-serve availability.
+- Support ticket volume reduction >= 20% vs. pre-GA baseline.
+- No event bus delivery failures lasting > 30 minutes.
 
 ---
 
-## 15) Open questions (v2 - for v3 resolution)
+### Phase 3: Full GA (6-9 months post-code-complete)
 
-**Q6: What is the correct behaviour when a merchant creates a `CreditBalance` with `seed_balance` for a customer who already has deduction activity in Stripe's sandbox environment?**
+**Scope:**
+- All four objects fully generally available; no waitlist.
+- `PaymentDelegate` expanded to all merchant categories.
 
-The `seed_balance` parameter is designed for production migration scenarios. In sandbox, merchants frequently reset test data. If a merchant deletes and recreates a `CreditBalance` with `seed_balance` for the same test customer, the reconciliation job will see a `credit_grant.type: migration` that does not match any prior deduction history - producing a false-positive drift alert. The reconciliation job needs a rule that exempts migration grants from the drift calculation on `CreditBalance` objects that are less than 24 hours old. This is a sandbox-specific edge case but needs to be resolved before the Phase 1 sandbox experience is built.
+**Architecture launch gates:**
 
-**Q7: What is the maximum number of `PaymentDelegate` objects that can be active simultaneously per customer?**
+| Gate | Criteria | Owner | Blocking? |
+|---|---|---|---|
+| Card network compliance confirmed | Visa and Mastercard legal liaisons confirm `PaymentDelegate` stored credential model is compliant | Legal | Yes |
+| Multi-currency workaround documented | Two-balance workaround for EUR/USD merchants documented in quickstart guide; tested with 5 Phase 2 merchants using it in production | Developer Experience | No (advisory) |
+| Per-customer delegate cap enforced | Hard cap of 50 active `PaymentDelegate` objects per customer enforced at API layer; `POST /v1/payment_delegates` returns `429 Delegate Cap Reached` when limit hit | API | Yes |
 
-The current data model has no limit. An agent-heavy product could theoretically create hundreds of active delegates per customer (one per agent session, per task type). The in-memory LRU cache on each edge node is sized for a bounded set of recently revoked delegate IDs. If a single customer has 500 active delegates and revokes all of them in a short window, the LRU cache could be flooded. A per-customer delegate cap (suggested: 50 active delegates) should be evaluated before Phase 1. The correct limit is a product question (what is the realistic maximum for agentic commerce?) as much as an infrastructure question.
+**Architecture kill switches (Phase 3):**
 
-**Q8: Should the reconciliation job emit events to the merchant's webhook endpoint when it corrects a drift, or is it strictly internal?**
+| Trigger | Action | Owner |
+|---|---|---|
+| Card network compliance objection | Immediately suspend `PaymentDelegate` for affected card types; provide 30-day migration path | Legal |
+| `PaymentDelegate` revocation rate > 15% within 7 days of first use across full GA cohort | Pause new `PaymentDelegate` creation; customer research sprint within 7 days | Agentic PM |
 
-The current design treats reconciliation corrections as internal events only. The argument for notifying merchants: they may have their own reconciliation logic that would detect the same discrepancy and act (incorrectly) before Stripe corrects it. The argument against: reconciliation corrections are rare and exposing them as merchant-visible events may cause confusion ("why did my balance change without a deduction or grant?"). A Stripe-internal event with a Dashboard support note is probably sufficient. Needs product and legal review before Phase 1.
+---
+
+## 17) Experiment backlog
+
+### Experiment 1: Idempotency key auto-generation in the Stripe SDK
+
+**Hypothesis:** Providing SDK-level auto-generated idempotency keys for `CreditDeduction` calls reduces merchant integration errors related to missing or duplicate idempotency keys by 50%, measured as `idempotency_key_missing` error rate in the first 30 days after activation.
+
+**Current state:** The `CreditDeduction` API requires an `Idempotency-Key` header. Merchants who forget to pass it receive a `400 Missing Idempotency-Key` error. This is the single most common integration mistake in closed beta.
+
+**Test design:**
+- Control: Current SDK; `Idempotency-Key` required and must be provided by caller.
+- Treatment: SDK generates a deterministic `Idempotency-Key` from `{customer_id}:{amount}:{unix_second}` if the caller does not provide one. The auto-generated key is logged in the SDK debug output so engineers can see what was generated.
+
+**Primary metric:** `idempotency_key_missing` error rate in first 30 days post-activation (per merchant cohort).
+**Secondary metric:** `idempotency_key_replay` rate (monitors whether auto-generation causes over-deduplication - e.g., two distinct calls in the same second with the same amount for the same customer incorrectly collapsed).
+
+**Risk:** Auto-generation based on `{customer_id}:{amount}:{unix_second}` has a 1-second collision window. If a merchant sends two distinct deductions of the same amount for the same customer within the same second, both will receive the same auto-generated key and the second will be treated as a replay. This is rare but real. The treatment variant must explicitly document this constraint and recommend merchant-provided keys for high-frequency deduction patterns.
+
+**Rollout:** Phase 2. SDK change (not API change); no server-side flag required. Opt-out for merchants who pass their own keys.
+**Kill switch:** If `idempotency_key_replay` rate increases by > 0.5% in treatment cohort, revert SDK default to requiring explicit key.
+**Acceptance criteria:** p < 0.05; `idempotency_key_missing` error rate reduced by >= 40%; `idempotency_key_replay` rate unchanged within 0.1%.
+**Owner:** Developer Experience + SDK team.
+
+---
+
+### Experiment 2: Balance low-warning notification before AutoTopUp threshold
+
+**Hypothesis:** Sending a "balance running low" notification at 2x the AutoTopUp threshold (e.g., if threshold is 10K, notify at 20K) reduces the proportion of customers who experience a sub-zero balance event (i.e., reach zero before AutoTopUp completes) by 30%.
+
+**Rationale:** AutoTopUp triggers when the balance crosses the threshold. The trigger-to-grant window is <10s P95, but 10 seconds of inference at high token consumption can drain the remaining threshold-level balance to zero. A "running low" notification at 2x threshold gives the merchant a UX moment to show the user "credits refilling soon" before the threshold is actually crossed, reducing apparent service interruption.
+
+**Test design:**
+- Control: `credit_balance.below_threshold` event only (current behaviour).
+- Treatment: New event `credit_balance.running_low` emitted when balance crosses below `2 x AutoTopUp.threshold`. No payment is triggered; this is a notification-only event. Merchant webhook receives it and can optionally show a "topping up soon" indicator to the user.
+
+**Primary metric:** Rate of `credit_deduction.failed` with `error_code: insufficient_credits` during an active AutoTopUp window (deductions that hit zero while AutoTopUp is pending).
+**Secondary metric:** Merchant opt-in rate to `credit_balance.running_low` webhook subscription (measures demand signal for this event).
+
+**Rollout:** Phase 2. New event type; purely additive; no breaking change. Merchants must opt in to receive `credit_balance.running_low` via webhook settings.
+**Kill switch:** N/A - this is an additive event. Remove from Phase 3 if opt-in rate < 5% (insufficient signal to justify ongoing maintenance).
+**Acceptance criteria:** `insufficient_credits` error rate during AutoTopUp windows reduced by >= 20% in opted-in merchant cohort; p < 0.05.
+**Owner:** Billing PM + Payments infra.
+
+---
+
+### Experiment 3: Graduated scope limits for new `PaymentDelegate` objects
+
+**Hypothesis:** Enforcing a conservative default `total_spend_cap` (e.g., $100) on newly created `PaymentDelegate` objects and requiring merchant action to raise it reduces `PaymentDelegate` fraud incidents by 80% in the first 30 days while preserving 95%+ of legitimate delegated transaction volume.
+
+**Rationale:** Fraudulent `PaymentDelegate` usage would most likely target the spend cap - a compromised or misconfigured agent could exhaust a large cap in seconds. A conservative initial cap limits blast radius for any single fraud event without requiring ongoing per-transaction review.
+
+**Test design:**
+- Control: No default cap; merchant-specified `total_spend_cap` at creation time (current design).
+- Treatment: Default `total_spend_cap` = $100 USD equivalent at creation if merchant does not specify a cap. Merchant can increase the cap via a Dashboard flow (requires re-authentication for caps > $1,000) or via API.
+
+**Primary metric:** Fraud-related `PaymentDelegate` revocations within 30 days of creation (where `revocation_reason = "fraud_suspected"` or Radar score > 80 on the transaction).
+**Secondary metric:** Merchant friction rate - proportion of merchants who hit the default cap and abandon the `PaymentDelegate` creation flow without raising it.
+
+**Rollout:** Phase 1 closed beta to gather signal on fraud patterns and merchant friction. Phase 3 full rollout if friction < 5%.
+**Kill switch:** If merchant friction rate > 10% (merchants hitting default cap and abandoning), revert to no default cap and increase recommended-cap guidance in docs instead.
+**Acceptance criteria:** Fraud-related revocations reduced by >= 60% in treatment cohort; p < 0.05; merchant friction rate < 5%.
+**Owner:** Fraud/Radar + Agentic PM.
+
+---
+
+### Experiment 4: Reconciliation correction visibility in Stripe Dashboard (Q8 follow-through)
+
+**Hypothesis:** Showing reconciliation corrections as internal Dashboard events (visible to Stripe support and the merchant's Stripe admin, but not surfaced in the merchant's webhook stream) reduces merchant confusion tickets about unexpected balance changes by 40%, compared to the alternative of no visibility (silently correcting).
+
+**Rationale:** See Q8 resolution in section 19. The question was whether to make corrections merchant-visible. The experiment tests whether a limited visibility (Dashboard only, no webhook) is better than the baseline of no visibility.
+
+**Test design:**
+- Control: Reconciliation corrections are internal only; no Dashboard entry.
+- Treatment: Reconciliation corrections appear in the merchant's Stripe Dashboard event timeline as "System balance correction - internal" with a hover tooltip explaining the correction type (`correction_type` field). No webhook emitted.
+
+**Primary metric:** Support ticket volume mentioning "unexpected balance change" or "balance incorrect" from merchants in each cohort.
+**Secondary metric:** Merchant self-service rate for balance discrepancy investigations (merchants who see the Dashboard event and resolve without escalating).
+
+**Rollout:** Phase 2. Dashboard-only change. No API or webhook change.
+**Kill switch:** If treatment increases support volume (merchants confused by seeing internal events), revert Dashboard display.
+**Acceptance criteria:** "Unexpected balance change" support tickets reduced by >= 30% in treatment cohort; p < 0.05; no increase in total support volume.
+**Owner:** Support tooling + Billing PM.
+
+---
+
+## 18) Resolved open questions (v1 - carried forward for completeness)
+
+### Q1: Reconciliation recovery (v1) - resolved in v2
+
+When the reconciliation job detects Redis balance < Postgres-derived balance:
+1. Log as P1 incident; acquire brief Redis SETNX lock on `credit_balance:{cb_id}` (TTL 2s).
+2. SET Redis balance to Postgres-derived value (not INCRBY).
+3. Release lock; emit `credit_balance.reconciliation_corrected` with `direction: "corrected_upward"`.
+4. Correction does NOT re-trigger `credit_balance.updated` or AutoTopUp threshold logic.
+5. Consecutive discrepancy across two reconciliation runs escalates from P1 to P0.
+
+### Q2: Deduction during in-progress AutoTopUp (v1) - resolved in v2
+
+Allow the deduction - do not hold. Document in integration guide: "If deduction returns `402 Insufficient Credits` during an active AutoTopUp window (typically resolves in <30s), surface a 'temporarily refilling credits' message to the user rather than a permanent billing error. Monitor `auto_top_up.succeeded` webhook to resume."
+
+### Q4: Pre-flight vs. confirmation re-validation for spend cap (v1) - resolved in v2
+
+Both. Atomic Postgres compare-and-swap at confirmation is the authoritative enforcement point. Pre-flight is a fast-fail optimisation only. See Layer 4 for implementation.
+
+### Q5: Revocation propagation fallback (v1) - resolved in v2
+
+See Layer 4 revocation propagation fallback path. If delegate not in in-memory LRU or local Redis cache AND delegate age > 60s, perform Postgres read replica fallback check. Cache result for 300s. Monitor `fallback_postgres_read_triggered` rate; alert at > 1%.
+
+---
+
+## 19) Resolved open questions (v2 - resolved in v3)
+
+### Q6: Migration grant false-positive drift in sandbox - resolved
+
+**Question:** A merchant deletes and recreates a `CreditBalance` with `seed_balance` for the same test customer in sandbox. The reconciliation job sees a `credit_grant.type: migration` that has no corresponding prior deduction history, producing a false-positive drift alert. How should the reconciliation job handle this?
+
+**Resolution:** The reconciliation job applies a **24-hour new-balance exclusion rule** for migration grant reconciliation:
+
+```
+For each CreditBalance with a credit_grant.type = 'migration' record:
+  IF (now() - credit_balance.created_at) < 24 hours:
+    -> Exclude the migration grant amount from the Postgres-derived balance calculation
+    -> The reconciliation check for this CreditBalance compares:
+         Redis balance
+         vs. (sum of credit_grants where type != 'migration') - (sum of credit_deductions)
+       + seeds the initial balance as the migration grant amount
+    -> Log reconciliation event with correction_type: "migration_grant_excluded"
+    -> No drift alert fires during this 24-hour window
+  ELSE:
+    -> Migration grant is treated as a standard grant in the Postgres-derived calculation
+    -> Any drift is a genuine error
+```
+
+**Why 24 hours:** This covers the full sandbox test-reset cycle for any merchant who creates a `CreditBalance` with a seed, runs tests, deletes, and recreates in a single day. After 24 hours, the migration grant is stable and should be fully reflected in both Redis and Postgres.
+
+**Production safeguard:** The `correction_type: "migration_grant_excluded"` field in the reconciliation instrumentation event lets operators distinguish these suppressed alerts from genuine drift suppression. If a production `CreditBalance` shows this correction type, it is expected behaviour during the 24-hour window after migration - not a signal to investigate.
+
+**Sandbox vs. production distinction:** The 24-hour rule applies in both `livemode: false` (sandbox) and `livemode: true` (production). In production, the migration grant scenario is real: merchants migrating from a DIY ledger to `CreditBalance` will always have a migration grant with no prior Stripe deduction history. The 24-hour window prevents false-positive drift alerts during the go-live period.
+
+---
+
+### Q7: Maximum number of active `PaymentDelegate` objects per customer - resolved
+
+**Question:** The data model has no per-customer delegate cap. An agent-heavy product could create hundreds of active delegates per customer. The in-memory LRU cache on each edge node is sized for a bounded set of recently revoked delegate IDs. If a single customer has 500 active delegates and revokes all of them in a short window, the LRU cache could be flooded.
+
+**Resolution:** Enforce a hard cap of **50 active `PaymentDelegate` objects per customer**.
+
+**Sizing reasoning:**
+
+```
+LRU cache entries per edge node: 50,000 (chosen)
+Cap per customer: 50 active delegates
+Maximum customers per edge node processing concurrent revocations: bounded by event bus throughput
+
+If every active customer with 50 delegates simultaneously batch-revokes all 50:
+  -> 50 LRU entries consumed per customer
+  -> At 1,000 concurrent customers performing batch revocations: 50,000 LRU entries consumed
+  -> This is the exact LRU capacity; cache is full but not overflowed
+
+LRU eviction handles the tail: delegates with TTL > 120s are evicted before
+new entries need to be inserted. In practice, the LRU is never under sustained pressure
+because: (1) most revocations are individual, not batch; (2) the 120s TTL expires most
+entries before the next revocation wave.
+```
+
+**Why 50 is the right cap:**
+
+- Real agentic commerce use cases: a traveller grants a travel agent delegate for one trip (1 delegate). A developer uses a coding assistant that purchases API credits (1-3 delegates per session). An e-commerce agent gets one delegate per checkout session.
+- The scenario that would require > 50 simultaneously active delegates per customer is an agentic platform that runs 50 parallel agents for the same user simultaneously - an edge case that should require explicit Stripe support approval rather than being a self-serve default.
+- Merchants who legitimately need > 50 can request an increased cap via their account team. This is a rate-limit exception pattern Stripe already uses for other API limits.
+
+**API behaviour:** `POST /v1/payment_delegates` returns `429 Delegate Cap Reached` with body `{"error": {"type": "rate_limit_error", "code": "payment_delegate_cap_reached", "message": "Customer has reached the maximum of 50 active PaymentDelegate objects. Revoke or expire existing delegates before creating new ones.", "param": "customer"}}` when the customer already has 50 active delegates.
+
+**Monitoring:** Add `payment_delegate_cap_reached` error count to the AI Billing Primitives dashboard. A spike in this error for a specific merchant signals either a legitimate high-volume agentic product (consider cap increase) or a bug in the merchant's delegate lifecycle management (leaking delegates without revoking).
+
+---
+
+### Q8: Should reconciliation corrections be merchant-visible events? - resolved
+
+**Question:** The current design treats reconciliation corrections as internal events only. Should merchants receive webhook notifications when Stripe corrects a drift in their `CreditBalance`?
+
+**Resolution:** Reconciliation corrections are **not emitted as merchant-facing webhooks**. They are visible in the Stripe Dashboard event timeline as internal events (see Experiment 4 for the UI design). The `credit_balance.reconciliation_corrected` event is internal instrumentation only.
+
+**Reasoning:**
+
+1. **Frequency is rare.** The reconciliation job only corrects drift in failure scenarios (Redis-Postgres async gap from a process crash). Under normal operation - which is the vast majority of time - no corrections fire. If they fired as merchant webhooks, merchants who see them during a degradation incident would be confused about what action to take on their end. The correct action is none: Stripe is self-healing.
+
+2. **The merchant cannot act on it.** Unlike `auto_top_up.failed` (where the merchant must handle dunning) or `payment_delegate.revoked` (where the agent must abort its task), a reconciliation correction has no required merchant action. Emitting it as a webhook would generate webhook handler code in merchant codebases for an event they have nothing useful to do with.
+
+3. **Potential for merchant confusion in production.** If a merchant receives `credit_balance.reconciliation_corrected` with `delta_tokens: 850, direction: "corrected_upward"`, their natural reaction is "did my customer get free credits?" - which is technically true in the edge case but is Stripe's infrastructure integrity recovery, not a business event. This confusion would generate more support tickets than it resolves.
+
+4. **Alternative: Stripe support tooling.** The `reconciliation.drift_check` internal event with `correction_type` is already logged and accessible to Stripe support in the account event log. If a merchant calls support asking about an unexpected balance change, support can identify and explain the correction without the merchant having instrumented for it.
+
+**Boundary condition:** If a reconciliation correction results in a balance change that triggers an `AutoTopUp` (i.e., the corrected balance crosses below the threshold), the AutoTopUp fires normally and the merchant receives the standard `auto_top_up.triggered` webhook. This is the correct behaviour - the merchant cares that a top-up was triggered; they do not need to know why the balance was at that level.
+
+---
+
+## 20) Operational runbook index
+
+| Runbook | Trigger | Location | Last updated |
+|---|---|---|---|
+| Balance Store Redis Failover | Redis cluster failure; all deductions returning 503 | Internal runbooks/billing/balance-store-redis-failover | v3 |
+| Reconciliation Drift P0 (favours customer) | Reconciliation job detects Redis balance > Postgres-derived balance | Internal runbooks/billing/reconciliation-p0-drift | v3 |
+| Reconciliation Drift P1 (favours merchant) | Reconciliation job detects Redis balance < Postgres-derived balance | Internal runbooks/billing/reconciliation-p1-drift | v3 |
+| AutoTopUp Orchestrator Recovery | `auto_top_up.system_error` event; PI creation failures | Internal runbooks/billing/autotopup-orchestrator-recovery | v3 |
+| Revocation Propagation Delay | `propagated_at` NULL after 90s for any delegate | Internal runbooks/billing/revocation-propagation-delay | v3 |
+| Concurrent Deduction Race Spike | WATCH/MULTI/EXEC collision rate > 5% for single `cb_id` | Internal runbooks/billing/concurrent-deduction-race | v3 |
+| Migration Grant False-Positive Drift | `correction_type: "migration_grant_excluded"` persisting after 24h | Internal runbooks/billing/migration-grant-drift | v3 |
+| Delegate Cap Reached Spike | `payment_delegate_cap_reached` rate spike for a merchant | Internal runbooks/billing/delegate-cap-spike | v3 |
+| LRU Cache Flood (batch revocation) | `fallback_postgres_read_triggered` rate > 1%; event bus delivery lag > 120s | Internal runbooks/billing/lru-cache-flood | v3 |
 
 ---
 
