@@ -4,8 +4,8 @@
 
 **PRD reference:** https://github.com/004mayank/product-prd/blob/main/perplexity-prd.md
 
-**Version:** v2 - Improved system design
-**Changes from v1:** Added Mermaid system architecture diagram and sequence diagram for the verification gate, detailed API contracts for the verifier service and audit API, instrumentation event schemas with field descriptions, competitive architecture comparison (vs. Google AI Overviews and ChatGPT Search), scaling model with capacity sizing, inter-service communication patterns with timeout/retry policies and circuit breaker design, deeper failure mode runbooks, and resolution of open questions Q2 (replacement source ranking) and Q5 (source cache TTL contract).
+**Version:** v3 - Final system design
+**Changes from v2:** Resolved all open questions (Q4 cross-turn source attribution via `source_retrieval_turn_index`; Q6 streaming UX specification for the pre-stream gate delay indicator). Added multi-region deployment topology diagram, phased rollout plan with per-phase launch gates and kill-switch conditions, experiment backlog with rollout owners and end-state decisions, operational runbook index, and complete version history.
 
 ---
 
@@ -15,6 +15,7 @@
 |---|---|
 | v1 | Core problem statement, five system layers, data flow narrative, core data model, failure modes, architectural trade-offs, open questions |
 | v2 | Mermaid diagrams (system + sequence), API contracts with error codes, instrumentation event schemas, competitive architecture comparison, scaling model, inter-service communication patterns, circuit breaker design, deeper failure mode runbooks, Q2 and Q5 resolved |
+| v3 | Resolved all remaining open questions (Q4 cross-turn attribution, Q6 streaming UX), multi-region topology diagram, phased rollout plan with launch gates and kill switches, experiment backlog with acceptance criteria and rollout owners, operational runbook index |
 
 ---
 
@@ -51,6 +52,7 @@ The system has five architectural layers:
 | Degraded mode activation rate | <0.5% of queries | `verification_pass_status: degraded` event rate | >1% of queries - investigate verifier service health |
 | Replacement source search P95 | <100ms | Replacement search span in gate coordinator | >120ms - log and assign `low_confidence` with original source; do not extend budget |
 | Verifier service circuit breaker trip rate | <0.1% of 5-min windows | Circuit breaker state transition events | >0.5% - investigate sustained error rate; review scaling headroom |
+| Cross-region replication lag (audit records) | <30s P99 | `CitationAuditRecord` replication lag monitoring | >60s - alert data platform on-call |
 
 ---
 
@@ -162,7 +164,7 @@ sequenceDiagram
 
 **Extraction strategy:** The service uses a rule-based parser tuned to Perplexity's answer structure (not a separate LLM call, which would add unacceptable latency). The parser identifies sentence boundaries, locates citation markers, and associates each marker with the immediately preceding sentence or clause. Where one superscript number appears at the end of a multi-clause sentence, each clause is treated as a separate claim with the same `citation_index` - this avoids over-crediting a single citation for claims it may not individually support.
 
-**v2 addition - Compound claim handling policy (resolves Q1 from v1):** When the LLM produces a multi-clause sentence ending with a single superscript (e.g., "AlphaFold2 uses the Evoformer architecture, trains on PDB structural data, and achieves 92.4 GDT on CASP14 targets [1]"), the parser splits at clause boundaries using a heuristic: commas followed by a coordinating conjunction ("and", "but", "or") and independent verb phrases are treated as clause boundaries. Each resulting clause becomes a separate `ClaimExtractionResult` with the same `citation_index`. The cross-encoder then scores each clause independently. The final `confidence_signal` for citation [1] uses the minimum score across all clauses from the same source - if the source supports "uses Evoformer" (score 0.89) but not "achieves 92.4 GDT on CASP14 targets" (score 0.41), the citation receives `low_confidence`. This is the conservative choice: one unverified clause in a compound claim taints the whole citation.
+**Compound claim handling policy:** When the LLM produces a multi-clause sentence ending with a single superscript (e.g., "AlphaFold2 uses the Evoformer architecture, trains on PDB structural data, and achieves 92.4 GDT on CASP14 targets [1]"), the parser splits at clause boundaries using a heuristic: commas followed by a coordinating conjunction ("and", "but", "or") and independent verb phrases are treated as clause boundaries. Each resulting clause becomes a separate `ClaimExtractionResult` with the same `citation_index`. The cross-encoder then scores each clause independently. The final `confidence_signal` for citation [1] uses the minimum score across all clauses from the same source - if the source supports "uses Evoformer" (score 0.89) but not "achieves 92.4 GDT on CASP14 targets" (score 0.41), the citation receives `low_confidence`. This is the conservative choice: one unverified clause in a compound claim taints the whole citation.
 
 **Edge case - zero citations:** If the LLM draft contains no citation superscripts, the Claim Extraction Service returns an empty list. The verification gate skips all verifier calls and sets `verification_pass_status: skipped_no_citations`. The answer streams immediately with no signals and no audit record.
 
@@ -178,11 +180,11 @@ sequenceDiagram
 
 **Cache lookup:** For each unique `source_url` in the claim list, the interface performs a key lookup against the retrieval cache (key structure: `source_text:{sha256(url)}`). The returned value is the full parsed text of the page at the time of retrieval, stored as a UTF-8 string. The cache TTL is set by the retrieval pipeline (typically 10-60 minutes depending on source type); the verification layer does not control or extend this TTL.
 
-**v2 addition - Source cache TTL contract (resolves Q5 from v1):** The verification layer requires the retrieval pipeline to maintain a minimum cache TTL of 120 seconds for all cited source URLs, measured from the moment the URL is first cached at retrieval time. This 120-second floor covers the worst-case LLM synthesis time (8-12 seconds for complex answers) plus the gate latency budget (600ms max), with comfortable headroom. The retrieval team owns the TTL configuration; the verification team monitors compliance via the `source_cache_miss_at_verification` event (see Section 9). The 95th-percentile cache hit rate target (>95%) is a shared SLO between the retrieval team and the verification team. If this SLO is missed for three consecutive days, the retrieval team is paged. The TTL floor of 120 seconds does not override the retrieval team's upper TTL limits for rapidly-updating sources (e.g., live news: typically 10 minutes; academic papers: typically 60 minutes).
+**Source cache TTL contract:** The verification layer requires the retrieval pipeline to maintain a minimum cache TTL of 120 seconds for all cited source URLs, measured from the moment the URL is first cached at retrieval time. This 120-second floor covers the worst-case LLM synthesis time (8-12 seconds for complex answers) plus the gate latency budget (600ms max), with comfortable headroom. The retrieval team owns the TTL configuration; the verification team monitors compliance via the `source_cache_miss_at_verification` event (see Section 9). The 95th-percentile cache hit rate target (>95%) is a shared SLO between the retrieval team and the verification team. If this SLO is missed for three consecutive days, the retrieval team is paged. The TTL floor of 120 seconds does not override the retrieval team's upper TTL limits for rapidly-updating sources (e.g., live news: typically 10 minutes; academic papers: typically 60 minutes).
 
 **Cache miss handling:** A miss means the source text is not available for verification. This happens when: (a) the source retrieval failed silently during the query pipeline, (b) the source page requires JavaScript rendering and the retrieval pipeline returned an empty body, (c) the cache entry expired between retrieval and verification (TTL regression or very long synthesis), or (d) the cached content is too short to segment meaningfully (<100 words). On a miss, the claim is passed to the Confidence Signal Layer with `source_passages: null`; the layer assigns `confidence_signal: unverified_claim`.
 
-**v2 addition - Paywall and JavaScript-render detection:** When cached content length is <500 words and the content string matches known paywall signature phrases ("subscribe to continue", "sign in to read", "enable JavaScript"), the interface assigns `cache_quality: paywall_blocked` or `cache_quality: js_required` instead of a simple miss. The Confidence Signal Layer maps these quality flags to a distinct signal state (`unverified_paywall` or `unverified_js_blocked`) rather than `unverified_claim`. This distinction is exposed in the audit record and in the source panel copy ("Source requires a subscription - could not verify this claim") so that Academic Focus users understand that the unverified signal reflects an access limitation, not a quality failure.
+**Paywall and JavaScript-render detection:** When cached content length is <500 words and the content string matches known paywall signature phrases ("subscribe to continue", "sign in to read", "enable JavaScript"), the interface assigns `cache_quality: paywall_blocked` or `cache_quality: js_required` instead of a simple miss. The Confidence Signal Layer maps these quality flags to a distinct signal state (`unverified_paywall` or `unverified_js_blocked`) rather than `unverified_claim`. This distinction is exposed in the audit record and in the source panel copy ("Source requires a subscription - could not verify this claim") so that Academic Focus users understand that the unverified signal reflects an access limitation, not a quality failure.
 
 **Source text segmentation:** The interface does not return the full page text as a single string to the verifier. It segments the cached text into overlapping windows of 512 tokens with 64-token overlap, returning up to 20 candidate passages per source. This windowing is done at this layer - before the verifier call - to reduce the payload size and to align with the cross-encoder's token input limit.
 
@@ -214,7 +216,7 @@ Output: [{claim_id, citation_confidence_score, source_passage_used, source_passa
 
 **Calibration requirements:** The Platt scaling parameters (a, b) must be re-fitted on a held-out calibration set before each model version promotion. The Expected Calibration Error (ECE) of the deployed model must be <0.05 on a 2,000-example calibration set. This is a model release gate: calibration test failure blocks production promotion.
 
-**v2 addition - Inter-service communication contract:** The Gate Coordinator calls the Semantic Verifier Service over an internal gRPC connection. The gRPC service definition:
+**Inter-service communication contract:** The Gate Coordinator calls the Semantic Verifier Service over an internal gRPC connection. The gRPC service definition:
 
 ```protobuf
 service SemanticVerifier {
@@ -287,8 +289,8 @@ citation_confidence_score >= 0.65 AND corroborating_sources == 1  -> single_sour
 citation_confidence_score  < 0.65 AND replacement_source_found   -> single_source (replacement applied)
 citation_confidence_score  < 0.65 AND no_replacement_found       -> low_confidence
 source_url == null OR source_passages == null                     -> unverified_claim
-cache_quality == paywall_blocked                                  -> unverified_paywall (v2 addition)
-cache_quality == js_required                                      -> unverified_js_blocked (v2 addition)
+cache_quality == paywall_blocked                                  -> unverified_paywall
+cache_quality == js_required                                      -> unverified_js_blocked
 ```
 
 **Corroborating source check:** The "corroborating_sources >= 2" condition for `verified` requires that at least two independently retrieved sources each score >= 0.65 for the same claim. The verifier is called once; the Confidence Signal Layer checks whether any other source in the answer's retrieved pool also scores >=0.65 for this claim without a separate model call - it reuses already-computed scores from the batch. If only one retrieved source covers the claim, the signal is `single_source`, not `verified`, regardless of the primary score.
@@ -300,7 +302,7 @@ cache_quality == js_required                                      -> unverified_
 | Exact-match override | Claim contains a specific date or proper noun that appears verbatim in the source document | Assign `verified_exact_match` flag; skip score threshold; set `confidence_signal: single_source` minimum |
 | PR domain override | `source_domain` matches known press release distribution domains (prnewswire.com, businesswire.com, globenewswire.com) | Lower `low_confidence` threshold from 0.65 to 0.55 for this source type; reduces false-positives from footer-structured date announcements |
 
-**v2 addition - Replacement source ranking (resolves Q5 from v1):** When a citation scores <0.65 and no override applies, the layer searches the answer's already-retrieved source pool for a better match. Candidate replacement sources are ranked by the following priority:
+**Replacement source ranking:** When a citation scores <0.65 and no override applies, the layer searches the answer's already-retrieved source pool for a better match. Candidate replacement sources are ranked by the following priority:
 1. Sources from the same top-level domain as the original citation (domain continuity indicates topical relevance).
 2. Remaining sources ranked by the retrieval pipeline's original relevance score (a proxy for topical relevance to the query, not to the specific claim).
 Ranked candidates are tried in order, up to 3, each using a targeted cross-encoder call (single (claim, passages) pair). The first candidate that scores >=0.65 is selected as the replacement source. If none of the top 3 score >=0.65 within the 100ms time budget, `low_confidence` is assigned and the original citation is retained. This ranked strategy outperforms random sampling on the internal evaluation set (hit rate 31% vs. 22% random) while keeping the replacement call count bounded.
@@ -421,12 +423,13 @@ Accept: application/json
           "citation_confidence_score": 0.91,
           "confidence_signal": "single_source",
           "source_passage_used": "...median GDT_TS score of 92.4 on free modelling...",
+          "source_retrieval_turn_index": 1,
           "replacement_source_attempted": false,
           "verifier_model_version": "cross-encoder-msmarco-MiniLM-L6-v2-platt-v1",
           "verification_latency_ms": 112
         }
       ],
-      "created_at": "2026-06-09T09:12:34Z"
+      "created_at": "2026-06-10T09:12:34Z"
     }
   ],
   "thread_verified_citation_pct": 0.83,
@@ -483,7 +486,7 @@ Triggers export generation for a Space's citation audit records.
   "export_id": "exp_3bM9pX",
   "format": "json",
   "download_url": "https://exports.perplexity.ai/exp_3bM9pX?sig=...",
-  "download_url_expires_at": "2026-06-10T09:12:34Z",
+  "download_url_expires_at": "2026-06-11T09:12:34Z",
   "total_answers_included": 47,
   "total_citations_included": 282,
   "verified_citation_pct": 0.84,
@@ -534,7 +537,7 @@ Poll endpoint for async PDF export status.
   "export_id": "exp_3bM9pX",
   "status": "ready",
   "download_url": "https://exports.perplexity.ai/exp_3bM9pX.pdf?sig=...",
-  "download_url_expires_at": "2026-06-10T09:14:12Z"
+  "download_url_expires_at": "2026-06-11T09:14:12Z"
 }
 ```
 
@@ -557,6 +560,8 @@ Poll endpoint for async PDF export status.
 
 Produced by the Semantic Verifier Service and Confidence Signal Layer during the gate. Rolled up into `CitationAuditRecord` before async persistence. Not stored independently.
 
+**v3 addition:** `source_retrieval_turn_index` field added to resolve Q4 (multi-turn conversation handling). This field records which turn in the thread originally retrieved the source used for this claim, enabling reviewers to understand cross-turn source reuse without inspecting multiple audit records.
+
 ```json
 {
   "claim_id": "string - UUID; unique per claim per answer turn",
@@ -568,6 +573,7 @@ Produced by the Semantic Verifier Service and Confidence Signal Layer during the
   "cache_quality": "enum: ok | paywall_blocked | js_required | too_short | miss",
   "source_passage_used": "string - the source passage that scored highest; max 512 chars",
   "source_passage_char_offset": "integer - byte offset of source_passage_used in the cached source document",
+  "source_retrieval_turn_index": "integer | null - the turn_index in this thread that originally retrieved this source URL. null if the source was retrieved in the current turn. Populated when a follow-up answer cites a source cached in a prior turn.",
   "raw_cross_encoder_score": "float - raw model output before Platt scaling",
   "citation_confidence_score": "float [0.0-1.0] - calibrated probability that source supports claim",
   "confidence_signal": "enum: verified | single_source | low_confidence | unverified_claim | unverified_paywall | unverified_js_blocked",
@@ -678,6 +684,7 @@ Emitted once per answer after the full verification pass completes, immediately 
     "source_cache_miss_count": "integer",
     "paywall_blocked_count": "integer",
     "js_blocked_count": "integer",
+    "cross_turn_source_reuse_count": "integer - number of claims where source_retrieval_turn_index != current turn",
     "user_plan": "string - free | pro | teams | enterprise",
     "verification_pass_status": "string - complete | degraded | skipped_no_citations | skipped_parse_failure",
     "circuit_breaker_tripped": "boolean"
@@ -740,7 +747,8 @@ Emitted when a confidence signal is displayed to the user in the rendered answer
     "focus_mode": "string",
     "synthesis_model": "string",
     "replacement_applied": "boolean",
-    "compound_claim": "boolean - true if claim was part of a multi-clause sentence"
+    "compound_claim": "boolean - true if claim was part of a multi-clause sentence",
+    "gate_indicator_shown_ms": "integer - how long the verifying indicator was visible before answer rendered; 0 if gate completed before page load"
   }
 }
 ```
@@ -781,6 +789,25 @@ Emitted when an Enterprise or Teams user accesses the audit panel in Spaces.
     "total_verified_in_session": "integer",
     "total_low_confidence_in_session": "integer",
     "audit_export_triggered": "boolean"
+  }
+}
+```
+
+### `gate_indicator_dismissed`
+
+**v3 addition (resolves Q6).** Emitted when the "Verifying citations..." gate indicator is dismissed by the answer being released. Used to measure how often and for how long the indicator is visible, and to detect cases where the indicator stalls (e.g., gateway timeout during partial load).
+
+```json
+{
+  "event": "gate_indicator_dismissed",
+  "properties": {
+    "thread_id": "string",
+    "answer_turn_index": "integer",
+    "indicator_visible_ms": "integer - wall-clock time the indicator was displayed before the answer rendered",
+    "focus_mode": "string",
+    "dismiss_reason": "string - gate_complete | timeout_passthrough | page_unloaded | navigation",
+    "connection_type": "string - 4g | 3g | 2g | wifi | unknown",
+    "slow_connection": "boolean - true if navigator.connection.effectiveType is 2g or 3g"
   }
 }
 ```
@@ -954,6 +981,40 @@ Academic Focus users in particular benefit from this distinction.
 
 ---
 
+### Flow E: Multi-turn conversation - cross-turn source reuse tracked (v3 addition)
+
+```
+Context: User is in a multi-turn Academic Focus session on protein folding.
+
+Turn 1: User asks "What is AlphaFold2?" -> Retrieval pipeline fetches 6 sources including url_A (Nature paper).
+  url_A is cached: source_text:{sha256(url_A)} with TTL 60min.
+  Turn 1 CitationAuditRecord created. All claims verified.
+
+Turn 2 (8 minutes later): User asks "How does AlphaFold2 compare to RoseTTAFold?"
+  LLM synthesises an answer citing url_A again for an AlphaFold2 claim.
+  Retrieval pipeline does NOT re-fetch url_A; the Turn 1 cache entry is still warm.
+
+Gate Coordinator for Turn 2:
+  Source Content Cache Interface looks up url_A -> cache hit (TTL: 60min; 52 minutes remaining).
+  Claim Extraction Service extracts the AlphaFold2 claim with citation to url_A.
+  CitationVerificationResult for that claim:
+    source_retrieval_turn_index: 1  (url_A was first cached during turn 1, not turn 2)
+    citation_confidence_score: 0.87
+    confidence_signal: single_source
+
+  Turn 2 CitationAuditRecord:
+    verification_results[0].source_retrieval_turn_index = 1
+    -> Reviewers reading Turn 2 audit record see that the url_A source dates from Turn 1's retrieval.
+       They can cross-reference Turn 1's audit record if they want to see the full source provenance.
+
+cross_turn_source_reuse_count: 1 emitted in citation_verification_completed event.
+
+Result: Enterprise reviewer opening the Turn 2 audit record understands which sources are fresh
+vs. inherited from earlier in the session. The audit trail is complete without inspecting all prior turns.
+```
+
+---
+
 ## 12) Failure modes and runbooks
 
 | Failure | Detection | Mitigation | User-visible behaviour | Runbook |
@@ -967,6 +1028,8 @@ Academic Focus users in particular benefit from this distinction.
 | Replacement source search timeout (>100ms) | Internal timeout in Confidence Signal Layer | Assign `low_confidence` with original citation; `replacement_source_attempted: true`, `replacement_source_url: null` | `low_confidence` badge shown with original citation | Check verifier service P95 for single-pair calls; if elevated, adjust replacement budget from 100ms to 80ms to preserve headroom |
 | Source cache TTL expiry (synthesis took longer than cache TTL) | `source_cache_miss_at_verification` with `miss_reason: ttl_expired` | Assign `unverified_claim` for the affected citation | No badge on affected citation | Alert retrieval team if TTL expiry miss rate >1%; confirm 120-second minimum TTL SLO is in place for all focus modes |
 | Concurrent query spike - verifier service overload | Verifier service P95 latency alert >300ms; degraded mode activation rate rising | Auto-scale verifier service replicas (horizontal); circuit breaker activates if error rate tips above 10% | Degraded mode activated for queries during the spike | Check HPA (Horizontal Pod Autoscaler) configuration; confirm scale-out lag; if scale-out insufficient, increase minimum replica count for peak hours |
+| Gate indicator visible for >3s (slow connection + long answer) | `gate_indicator_dismissed` event with `indicator_visible_ms > 3000` | UX: indicator shows progress animation; no additional system intervention | User sees animated "Verifying citations..." for up to 3s before answer | If >5% of Academic Focus sessions show indicator_visible_ms >3s, investigate gate budget compliance; consider progressive release (stream first paragraph before gate completes on very long answers) |
+| Cross-region audit record replication lag >60s | Replication lag monitor alert | Alert data platform on-call; read API falls back to primary write replica for the affected region | Enterprise audit API may show slight delay in surfacing newly-written records | Check replication slot health on Postgres primary; review network throughput between regions; if sustained >5 min, route audit API reads to primary |
 
 ---
 
@@ -980,7 +1043,7 @@ Perplexity Verified Answers occupies a unique architectural position: it is the 
 | Citation granularity | Per-claim (each factual assertion has its own confidence score) | Per-answer (source chips shown per answer block, not per claim) | Per-source (footnote numbers linked to sources; no claim-level attribution) |
 | Confidence signal to user | Three-level signal: `verified` / `low_confidence` / `unverified_claim` | None; no confidence signal to user for individual citations | None |
 | Audit trail | Full `CitationAuditRecord` per answer turn; accessible via API for Teams/Enterprise | None | None |
-| Source re-use across session | Retrieval cache shared across turns in same session | Retrieval cache within session; not exposed | Not published |
+| Source re-use across session | Retrieval cache shared across turns in same session; `source_retrieval_turn_index` tracks origin | Retrieval cache within session; not exposed | Not published |
 | Latency cost | +400ms P95 (Academic Focus); +600ms P95 (Web Focus) for verified gate | 0ms additional (no verification step) | 0ms additional |
 | False-positive risk | 7.2% (cross-encoder MiniLM v1); mitigated by override rules and weekly sampling | Not applicable (no per-claim scoring) | Not applicable |
 | Enterprise audit capability | Yes - per-answer audit record, JSON/PDF export, Audit API | No | No |
@@ -1052,7 +1115,7 @@ The Semantic Verifier Service is deployed on Kubernetes with a Horizontal Pod Au
 
 **Why A wins for the target segment:** Knowledge workers and academic researchers use verified citations to make high-stakes decisions - pasting into decks, citing in papers, forwarding to colleagues. If the signal arrives after the claim is already read and processed, the user has formed an initial trust judgment. Post-hoc signal revision is cognitively more disruptive than pre-formed confidence from the start. For this segment, 400ms of additional latency is acceptable; a confidence signal that feels like a footnote rather than a guarantee is not.
 
-**Cost of A:** Time-to-first-token is 400ms (Academic Focus) to 600ms (Web Focus) slower than baseline. A "verifying citations..." indicator during the gate delay is the required UX compensation.
+**Cost of A:** Time-to-first-token is 400ms (Academic Focus) to 600ms (Web Focus) slower than baseline. A "verifying citations..." indicator during the gate delay is the required UX compensation (see Section 16, Q6 resolution for full UX spec).
 
 ---
 
@@ -1104,31 +1167,288 @@ The Semantic Verifier Service is deployed on Kubernetes with a Horizontal Pod Au
 
 ---
 
-## 16) Open questions - status update (v2)
+## 16) Open questions - all resolved (v3)
 
 **Q1 (compound claim parsing) - RESOLVED in v2**
 
 Decision: The Claim Extraction Service splits compound claims at coordinating conjunction boundaries and applies the minimum score rule across clauses from the same source. See Layer 1 detail above.
 
+---
+
 **Q2 (JavaScript-rendered and paywalled source handling) - RESOLVED in v2**
 
 Decision: Introduce `cache_quality` enum with `paywall_blocked` and `js_required` states. The Confidence Signal Layer maps these to distinct signal states (`unverified_paywall`, `unverified_js_blocked`) with distinct source panel copy. This avoids the false `unverified_claim` label for sources that are inaccessible rather than non-supportive. See Layer 2 detail and Flow D above.
+
+---
 
 **Q3 (source cache TTL contract) - RESOLVED in v2**
 
 Decision: Formalise a shared SLO between the retrieval team and the verification team: minimum 120-second TTL for all cited URLs, measured from first cache time at retrieval. Monitored via `source_cache_miss_at_verification` event with `miss_reason: ttl_expired`. See Layer 2 detail above.
 
-**Q4 (multi-turn conversation handling for audit records) - OPEN**
+---
 
-Each `CitationAuditRecord` is self-contained per answer turn. When a follow-up answer cites sources retrieved in a prior turn (cache hit from turn 1's retrieval run), the turn 2 audit record captures the `CitationVerificationResult` for those claims using the sources available at verification time - it does not reference the turn 1 `CitationAuditRecord`. A reviewer reading turn 2 in isolation sees a complete audit trail for turn 2's claims, but does not see the source's retrieval origin. Whether this is acceptable for enterprise audit purposes or requires a cross-turn reference field is unresolved. Proposed resolution for v3: add an optional `source_retrieval_turn_index` field to `CitationVerificationResult` that records which turn retrieved the source used for this claim.
+**Q4 (multi-turn conversation handling for audit records) - RESOLVED in v3**
+
+**Decision:** Add `source_retrieval_turn_index` (nullable integer) to `CitationVerificationResult`. When a follow-up answer cites a source URL that was first cached during a prior turn in the same thread, the Gate Coordinator populates `source_retrieval_turn_index` with the original turn's index. The Gate Coordinator determines this by looking up the source URL in a lightweight per-thread source provenance map held in memory during the session (key: sha256(url) -> first_turn_index; the map is initialised from the retrieval pipeline's cache metadata and is cleared when the session expires).
+
+This resolves the reviewer concern: a Turn 2 audit record is now self-contained for all claims in Turn 2, but reviewers can also see which sources are inherited from prior turns without inspecting the Turn 1 record separately. The `cross_turn_source_reuse_count` field in `citation_verification_completed` provides an aggregate signal for monitoring how often cross-turn reuse occurs (expected: high for deep research sessions; near zero for one-shot queries).
+
+**What this does NOT do:** It does not store a back-reference to the Turn 1 audit record. The `source_retrieval_turn_index` integer is sufficient for a human reviewer to navigate; a formal record-to-record link would add a graph traversal cost to every audit read that is not justified by the use case. Enterprise reviewers needing full cross-turn provenance can issue a GET request for the thread's full audit record set (`GET /v1/audit/threads/{thread_id}` without `turn_index` filter) to reconstruct the provenance chain.
+
+See Flow E above for a concrete example. See the updated `CitationVerificationResult` schema in Section 8 for the field definition.
+
+---
 
 **Q5 (replacement source selection ranking) - RESOLVED in v2**
 
 Decision: Ranked by domain continuity first, then retrieval pipeline relevance score. See Layer 4 detail above.
 
-**Q6 (confidence signal display during streaming for long answers) - OPEN**
+---
 
-The pre-stream gate creates a step-change reveal for long answers (>500 words). The PRD directionally chose option (b): "verifying citations..." indicator during the gate, then the full answer with badges simultaneously. The exact UX specification for the indicator animation, timing, and behaviour during partial-load states on slow connections is not yet designed. Proposed resolution for v3: UX mockup review with Core Experience team; confirm that the renderer handles gate-release as an atomic event (not a progressive token stream) for long answers in Academic Focus mode.
+**Q6 (confidence signal display during streaming for long answers) - RESOLVED in v3**
+
+**Decision:** The pre-stream gate is an atomic hold: the entire enriched answer payload is released in a single event, not as a progressive token stream. This means the "verifying citations..." indicator is shown from the moment the LLM synthesis completes until the Gate Coordinator releases the payload. The UX specification is as follows:
+
+**Indicator appearance:**
+- Component: A pill-shaped banner below the Perplexity search bar (not overlaying the answer area).
+- Copy: "Verifying citations..." with a three-dot pulse animation.
+- The indicator appears at the same moment the synthesis completes (before gate processing starts), not after gate processing starts. This means users see it for 200-600ms for typical answers, not just the gate overhead itself - it appears at the start of the wait, so users understand why streaming has not started.
+- The indicator is dismissed atomically when the enriched payload arrives. The answer renders all at once with badges visible from the first render frame.
+- On slow connections (2G/3G, detected via `navigator.connection.effectiveType`), the copy changes to "Verifying citations - this takes a moment on slower connections..." to set expectations. The gate timeout thresholds are NOT adjusted for slow connections; the gate must still complete within its SLO or degrade to passthrough.
+
+**Edge case - gate exceeds 3 seconds visible (network issue or extreme synthesis time):**
+- If `gate_indicator_dismissed` is not fired within 3 seconds of the indicator appearing, the gate coordinator must either: (a) if the verifier has returned but the network round-trip to the browser has stalled, degrade to passthrough and stream the unverified answer; or (b) if the verifier is still running, the existing circuit breaker and timeout logic handles this case (degraded mode activates at 350ms/550ms hard timeout - this edge case cannot occur in normal gate operation). The 3-second indicator threshold is a browser-side failsafe only.
+- If `dismiss_reason: timeout_passthrough` appears in `gate_indicator_dismissed` event above 0.1% rate for any 1-hour window, alert on-call backend engineer.
+
+**Long answer UX (>800 words, Academic Focus):**
+- Long answers (>800 words) take longer to synthesize (8-20 seconds of LLM generation). The gate only starts after synthesis completes. The synthesis streaming time is NOT part of the gate latency budget; the user sees the query being processed during synthesis. The gate indicator only appears after synthesis is done, for the gate overhead specifically.
+- This means for very long answers, the user flow is: [typing indicator during synthesis, 8-20s] -> [brief "Verifying citations..." indicator, 200-600ms] -> [full answer with badges].
+- The Core Experience team confirmed in design review that this flow is acceptable: the gate indicator is brief relative to synthesis time, and appearing at the very end of a long synthesis feels natural, not intrusive.
+
+**Renderer implementation requirement:** The browser renderer must handle the full enriched answer payload as an atomic render event (not a token-by-token stream). This requires a coordination handshake: the synthesis streaming pipeline generates tokens locally (for latency perception), but the renderer holds them in a client-side buffer until the Gate Coordinator signals payload release. The buffer is cleared and the answer is rendered in full with badges on the release signal. This renderer architecture change is a Phase 1 prerequisite (listed in the launch readiness checklist in Section 18).
+
+**Instrumentation:** The `gate_indicator_shown_ms` field in `citation_signal_rendered` and the new `gate_indicator_dismissed` event (see Section 9) provide full observability over indicator visibility time, dismiss reason, and connection type.
+
+---
+
+## 17) Multi-region deployment topology
+
+At Phase 3 scale, the verification gate and audit persistence layer are deployed across at minimum two regions to provide availability and latency parity for Perplexity's global user base. The topology below shows the primary (us-east-1) and secondary (eu-west-1) deployment, reflecting Perplexity's primary user concentration in North America and Europe.
+
+```mermaid
+flowchart TD
+    subgraph Global["Global Layer"]
+        CDN[CDN + API Gateway\nGeoDNS routing\nLatency-based failover]
+    end
+
+    subgraph USEast["Primary Region - us-east-1"]
+        direction TB
+        GC_US[Gate Coordinator\nfleet - us-east-1]
+        CES_US[Claim Extraction Service\nus-east-1]
+        SCCI_US[Source Cache Interface\nus-east-1]
+        SVS_US[Semantic Verifier Service\nGPU cluster - us-east-1\n4-20 A100 instances]
+        CSL_US[Confidence Signal Layer\nus-east-1]
+        REDIS_US[(Redis Cluster\nus-east-1\nSource cache + circuit breaker state)]
+        KAFKA_US[Kafka cluster\nus-east-1\ncitation-audit-records topic]
+        PG_US[(Postgres Primary\nus-east-1\nCitationAuditRecord write path)]
+        PG_READ_US[(Postgres Read Replica\nus-east-1\nAudit API reads)]
+    end
+
+    subgraph EUWest["Secondary Region - eu-west-1"]
+        direction TB
+        GC_EU[Gate Coordinator\nfleet - eu-west-1]
+        CES_EU[Claim Extraction Service\neu-west-1]
+        SCCI_EU[Source Cache Interface\neu-west-1]
+        SVS_EU[Semantic Verifier Service\nGPU cluster - eu-west-1\n4-10 A100 instances]
+        CSL_EU[Confidence Signal Layer\neu-west-1]
+        REDIS_EU[(Redis Cluster\neu-west-1\nSource cache + circuit breaker state)]
+        KAFKA_EU[Kafka cluster\neu-west-1\ncitation-audit-records topic]
+        PG_EU[(Postgres Read Replica\neu-west-1\nAudit API reads; async replication from us-east-1)]
+    end
+
+    CDN -->|North America + APAC queries| GC_US
+    CDN -->|Europe queries| GC_EU
+
+    GC_US --> CES_US
+    CES_US --> SCCI_US
+    SCCI_US --> REDIS_US
+    SCCI_US --> SVS_US
+    SVS_US --> CSL_US
+    CSL_US --> KAFKA_US
+    KAFKA_US -->|async write| PG_US
+    PG_US -->|async replication < 30s P99| PG_EU
+
+    GC_EU --> CES_EU
+    CES_EU --> SCCI_EU
+    SCCI_EU --> REDIS_EU
+    SCCI_EU --> SVS_EU
+    SVS_EU --> CSL_EU
+    CSL_EU --> KAFKA_EU
+    KAFKA_EU -->|async cross-region write| PG_US
+
+    PG_US --> PG_READ_US
+    PG_EU --> PG_EU
+
+    note1["Audit writes always go to us-east-1 Postgres primary\nRegional Kafka topics forward to primary\nAudit reads served from local replica per region"]
+```
+
+**Key topology decisions:**
+
+| Decision | Rationale |
+|---|---|
+| Verifier GPU fleet is region-local | Sending claim-passage batches cross-region adds 30-80ms latency on the gRPC call - this blows the 350ms gate budget. Each region runs its own GPU cluster. |
+| Source cache is region-local (Redis) | Same latency argument; cache reads must be <15ms P95. Cross-region cache reads average 30-60ms. |
+| Audit writes fan into a single Postgres primary (us-east-1) | Simplifies cross-turn audit record consistency for multi-turn sessions that may span regions within the same session. Kafka cross-region fanout is async; write latency is not on the user-facing path. |
+| Circuit breaker state in regional Redis | Each region's circuit breaker operates independently. A verifier outage in eu-west-1 does not affect us-east-1. This is correct: the breaker is a per-region safeguard, not a global kill switch. |
+| Audit API reads from regional read replicas | Reduces cross-region read latency for EU enterprise users. Async replication lag (<30s P99) is acceptable for audit reads; enterprise users are not querying audit records in real time. |
+
+---
+
+## 18) Phased rollout plan
+
+### Phase 1 - Academic Focus verification with A/B signals (Weeks 1-16)
+
+**Engineering scope:**
+- Claim Extraction Service deployed to 100% of Academic Focus query path.
+- Semantic Verifier Service (`MiniLM` + Platt scaling) deployed in us-east-1; eu-west-1 deployment at week 8 after us-east-1 stability confirmed.
+- `CitationAuditRecord` write path live for all Academic Focus answers.
+- Confidence signals rendered to 50% treatment arm (A/B split by user hash, not session hash; consistent per user across sessions).
+- Renderer buffer hold (Q6 resolution) implemented for Academic Focus stream.
+- Gate indicator UX live for treatment arm.
+
+**Launch gate (all criteria must pass before Phase 1 goes live):**
+
+| Gate criterion | Threshold | Evidence source |
+|---|---|---|
+| Verifier model false-positive rate | <8% on 500-example labelled test set | ML release evaluation |
+| Verification gate P95 latency (Academic Focus) | <400ms on synthetic load test at 200 concurrent QPS | Load test result |
+| Degraded-mode chaos test passed | Answers stream without error when verifier service is at 100% failure rate in staging | Staging chaos test result |
+| `CitationAuditRecord` write path load tested | Handles 30M writes/day without write latency regression | Storage load test |
+| Platt scaling ECE | <0.05 on 2,000-example holdout set | ML calibration report |
+| Gate indicator UX implemented | Renderer buffer hold atomic release confirmed across Chrome, Safari, Firefox, iOS, Android | Cross-platform QA sign-off |
+| `gate_indicator_dismissed` event instrumented | Event fires on 100% of Academic Focus answers where gate ran; `dismiss_reason` field populated correctly | Staging instrumentation validation |
+| `source_retrieval_turn_index` populated | Correct turn index populated for 100% of cross-turn source reuse cases in test sessions | Automated integration test on 50 multi-turn sessions |
+| Privacy review complete | `CitationAuditRecord` retention policy approved | Signed review document |
+
+**Kill-switch trigger conditions:**
+
+| Condition | Action |
+|---|---|
+| Academic Focus answer P95 latency (time-to-first-token) >3.5s for any 7-day rolling window | Pause rollout; optimize verifier batch parallelism before resuming |
+| Pro churn rate for treatment cohort exceeds control by >0.5 pp at day 14 | Pause signals-visible arm; investigate whether `low_confidence` labels are causing trust damage; do not pause signals-hidden arm |
+| Verifier service error rate >1% of queries for any 1-hour window | Auto-activate degraded mode (no signals shown); page on-call ML Platform engineer |
+| `gate_indicator_dismissed` with `dismiss_reason: timeout_passthrough` >0.1% for any 1-hour window | Investigate gate coordinator timeout path; confirm circuit breaker and hard-timeout are functioning |
+| Citation accuracy improvement vs. baseline <3 pp at day 42 | Evaluate verifier model retraining before expanding to Web Focus |
+
+**Owner:** ML Platform (model serving) + Core Experience (UI + renderer buffer) + Backend Platform (audit persistence) + Analytics (A/B instrumentation).
+
+---
+
+### Phase 2 - Web Focus Pro + enterprise audit trail (Weeks 17-28)
+
+**Engineering scope:**
+- Verification extended to Web Focus Pro users (50% A/B split).
+- `electra-base` model deployed for Web Focus; `MiniLM` remains for Academic Focus.
+- Platt scaling recalibrated on Web Focus-specific 2,000-example calibration set.
+- Audit API (`GET /v1/audit/threads/{thread_id}`) live for Teams and Enterprise keys.
+- Spaces citation audit panel UI live for Teams and Enterprise accounts.
+- Audit export (JSON + PDF) live.
+- eu-west-1 GPU cluster scaled to Phase 2 Web Focus capacity (minimum 10 replicas).
+- Labelling project: 10,000-example batch from live corpus; annotation tooling live.
+
+**Launch gate:**
+
+| Gate criterion | Threshold | Evidence source |
+|---|---|---|
+| Phase 1 A/B result: Academic Focus citation click rate lift | >+3 pp at 95% significance | Analytics A/B report |
+| Phase 1 A/B result: Pro churn guardrail | Treatment cohort churn not >0.5 pp above control | Analytics cohort report |
+| `electra-base` false-positive rate on Web Focus test set | <6% on 200-example Web Focus labelled set | ML release evaluation |
+| Web Focus gate P95 latency | <600ms at 400 concurrent QPS in load test | Load test result |
+| Audit API rate limiting enforced | 100 req/min/account tested with token-bucket verification | API contract test |
+| PDF export generation latency | <60s for 100-answer sessions in staging | Staging performance test |
+| `methodology_disclaimer` copy approved by Legal | Signed legal review | Legal sign-off document |
+| Inter-annotator agreement gate | Cohen's kappa >= 0.82 on 500-example labelling spot check | Annotation quality report |
+
+**Kill-switch trigger conditions:**
+
+| Condition | Action |
+|---|---|
+| Web Focus Pro answer P95 latency >4s for any 7-day rolling window | Pause Web Focus signals; fall back to `MiniLM` for Web Focus while `electra-base` serving is investigated |
+| Web Focus Pro churn rate in treatment cohort exceeds control by >0.5 pp at day 14 | Pause Web Focus signals-visible arm; root cause analysis before resuming |
+| Audit export triggers any privacy incident (unauthorized data access; export scoping bug) | Disable export endpoint immediately; incident response runbook activation |
+| Web Focus citation accuracy improvement <4 pp vs. baseline at day 42 | Hold Phase 3 until improvement reaches 4 pp; evaluate `electra-base` recalibration |
+
+**Owner:** ML Platform (electra-base + Platt recalibration + labelling infra) + Core Experience (Web Focus UI) + Backend Platform (audit API + Spaces panel) + Spaces team (audit panel UI) + Legal (disclaimer review) + Analytics (Web Focus A/B).
+
+---
+
+### Phase 3 - Full rollout + proprietary model + enterprise GA (Weeks 29-42)
+
+**Engineering scope:**
+- Verification rolled to 100% of Web Focus free-tier users.
+- `perplexity-claim-verifier-v1` promoted to Web Focus production if model quality and cost gates pass; `electra-base` remains as hot fallback (switchable within 5 minutes).
+- Enterprise audit panel and API promoted from beta to GA.
+- Competitive accuracy benchmark published as a public research blog post.
+- Canary deployment to 5% of free-tier Web Focus users at week 29 before full rollout.
+- Monthly accuracy evaluation job scheduled for `perplexity-claim-verifier-v1`.
+
+**Launch gate:**
+
+| Gate criterion | Threshold | Evidence source |
+|---|---|---|
+| `perplexity-claim-verifier-v1` model accuracy gate | >93% accuracy AND <4% false-positive rate on held-out Perplexity test set | ML release evaluation |
+| `perplexity-claim-verifier-v1` serving cost gate | <$0.12/1M claims at P50 on production-equivalent infra | Infrastructure cost measurement |
+| Phase 2 Web Focus Pro A/B result: citation click rate | >+3 pp at 95% significance | Analytics A/B report |
+| Free-tier `low_confidence` rate projection | <18% per answer for representative free-tier query mix | ML Platform projection using Phase 2 data |
+| `electra-base` hot fallback confirmed | Rollback to `electra-base` deployable within 5 minutes | Deployment runbook tested in staging |
+| Enterprise GA QA | Zero critical bugs in audit panel and export across 5 enterprise customer profiles | Enterprise QA sign-off |
+| Competitive benchmark publication cleared | Methodology cleared by Legal and Trust/Safety | Legal sign-off document |
+
+**Kill-switch trigger conditions:**
+
+| Condition | Action |
+|---|---|
+| Free-tier `low_confidence` signal rate >25% per answer in first 7 days | Raise `low_confidence` threshold from 0.65 to 0.70 for free tier; monitor for 7 days before re-evaluating |
+| `perplexity-claim-verifier-v1` accuracy degrades >2 pp vs. Phase 3 launch baseline at monthly evaluation | Revert to `electra-base` within 5 minutes; open model drift incident |
+| `gate_indicator_dismissed` with `dismiss_reason: timeout_passthrough` >0.5% for any 1-hour window during free-tier rollout | Investigate gate coordinator under free-tier query mix; free-tier queries may have longer synthesis times |
+| Competitive benchmark publication causes a negative PR event | Pause publication; full audit of the 500-query set before re-publishing |
+
+**Owner:** ML Platform (proprietary model + free-tier rollout) + Core Experience (free-tier UI) + Enterprise team (GA launch) + Marketing/Research (benchmark publication) + Analytics (rollout postmortem).
+
+---
+
+## 19) Experiment backlog
+
+| Experiment | Hypothesis | Primary metric | Acceptance criteria | Guardrail | Kill-switch | Rollout phase | Owner | End-state decision |
+|---|---|---|---|---|---|---|---|---|
+| Renderer buffer hold vs. progressive badge injection | Atomic gate-release (current design) vs. streaming tokens first with badges added as each citation is verified provides better P95 answer delivery perception | `gate_indicator_dismissed.indicator_visible_ms` median; post-answer satisfaction signal (not instrumentable directly - proxy: D7 return rate) | Atomic release does not produce lower D7 return than progressive injection (non-inferiority test, delta 0.5 pp, n=2,000 sessions per variant) | Academic Focus answer latency P95 must not increase in either variant | If D7 return rate drops >1 pp in atomic release arm: move to progressive injection; accept the cognitive cost of late badge arrival for <1pp return rate improvement | Phase 1 (shadow; no user-visible difference between variants) | Core Experience + Analytics | If atomic release is non-inferior: keep; it is simpler to implement. If inferior: plan progressive injection for Phase 2. |
+| `verified` badge colour saturation (high-contrast green vs. muted green) | Muted green badge is less alarming and produces higher `citation_clicked_with_signal` rate on `verified` citations vs. high-contrast green (which may feel like a traffic light warning) | `citation_clicked_with_signal` rate for `signal_type: verified` | Muted variant achieves click rate within -2 pp of high-contrast; no significant difference in Pro conversion | WCAG 2.1 AA contrast ratio must be maintained for both variants | None - UI only; no data integrity risk | Phase 1 (embedded in A/B) | Core Experience + Design | Adopt whichever produces higher `verified` citation click rate; update design system tokens |
+| Gate indicator copy A/B ("Verifying citations..." vs. "Checking your sources...") | "Checking your sources..." copy is more conversational and reduces user anxiety during the gate delay | `gate_indicator_dismissed.indicator_visible_ms` (proxy for user aborting); D7 return rate | Neither variant shows >0.5 pp lower D7 return; "Checking your sources..." is preferred by qualitative survey (optional) | N/A | If either variant shows D7 return regression >0.5 pp: revert to current copy | Phase 1 | Core Experience + Copy | Adopt winning copy globally across all gate indicator contexts |
+| `source_retrieval_turn_index` surfaced in audit panel | Showing "Retrieved in turn X" next to each citation in the Spaces audit panel helps enterprise reviewers understand source freshness per turn | `citation_audit_panel_opened` session duration (proxy for reviewer engagement with richer data); `audit_export_triggered` rate | Teams accounts that see the turn index show >10% higher audit export rate vs. control | Audit panel load time must not increase >100ms | If load time increases >200ms: lazy-load the turn index field after initial panel render | Phase 2 (Teams beta) | Enterprise team + Spaces team | If export rate lift confirmed: ship to GA; if not: remove the field from the audit panel UI (keep in API response) |
+| Monthly verifier model accuracy evaluation - automated re-calibration trigger | Automatically re-fitting Platt scaling when ECE drifts above 0.07 (before the manual 12% false-positive alert fires) produces lower false-positive rate drift between manual review cycles | ECE on held-out calibration set (monthly re-evaluation) | Automated re-calibration keeps ECE <0.06 at 30-day interval; false-positive rate sampled weekly stays <10% | Re-calibration must not trigger during peak traffic hours (08:00-22:00 UTC); must complete and deploy within 4 hours of trigger | If automated re-calibration produces a false-positive rate regression (>10%) in post-deployment monitoring: roll back Platt parameters to the previous version; open incident | Phase 1 onward | ML Platform | If effective: make automated Platt recalibration part of the monthly model evaluation job; log every re-calibration event |
+| Cross-region verifier model version sync | Deploying model updates simultaneously to both regions (vs. staged us-east-1 then eu-west-1) produces lower false-positive rate variance between regions during the promotion window | False-positive rate delta between regions in the 72-hour window after a model version promotion | Delta <1 pp between regions during the promotion window | Cross-region GPU capacity must be adequate for simultaneous promotion canary (10% traffic in each region during canary) | If any region's false-positive rate exceeds 12% during simultaneous promotion: roll back both regions simultaneously | Phase 2 (two-region deployment active) | ML Platform + Infra | If simultaneous promotion is safe: adopt as standard; reduces audit record inconsistency during promotion windows |
+| `perplexity-claim-verifier-v1` shadow evaluation vs. `electra-base` (Phase 3 pre-promotion) | Proprietary model achieves >93% accuracy and <4% false-positive rate on live Perplexity query distribution, validating the Phase 3 model promotion criteria | Accuracy and false-positive rate on held-out Perplexity test set; shadow mode comparison on 5% of live Web Focus queries (results not shown to users) | >93% accuracy; <4% false-positive; <$0.12/1M claims; no statistically significant accuracy regression vs. `electra-base` on any Focus mode subcategory | `electra-base` must remain the production model during shadow evaluation; no user sees proprietary model results | If proprietary model shows accuracy regression on any Focus mode: extend training with additional data from that subcategory; do not promote | Phase 3 (pre-promotion gate) | ML Platform | If all criteria met: promote to production for Web Focus; `MiniLM` remains for Academic Focus until Phase 3 month 2 evaluation |
+
+---
+
+## 20) Operational runbook index
+
+The following runbooks are required before Phase 1 launch. Each runbook must be authored, reviewed, and linked from the on-call dashboard. Runbook IDs are for reference in incident reports.
+
+| Runbook ID | Title | Scope | Owner | Phase required |
+|---|---|---|---|---|
+| `RB-VER-01` | Degraded mode activation and manual override | How to manually activate and deactivate degraded mode (passthrough) for the verification gate across all gate coordinator instances; use when the circuit breaker does not self-recover | ML Platform | Phase 1 |
+| `RB-VER-02` | Circuit breaker recovery procedure | Steps to diagnose and recover a stuck circuit breaker (open state persisting >15 minutes); includes Redis key inspection, verifier service health checks, and half-open probe forcing | ML Platform + Backend Platform | Phase 1 |
+| `RB-VER-03` | Verifier model rollback | How to roll back the Semantic Verifier Service to the previous model version (e.g., `platt-v1` -> `platt-v0`); covers updating the model pointer, restarting pods, and confirming ECE on the rolled-back version | ML Platform | Phase 1 |
+| `RB-VER-04` | Audit record reconciliation and dead-letter replay | Steps to investigate and resolve `CitationAuditRecord` write failures; covers dead-letter queue inspection, manual replay, and reconciliation job re-run | Backend Platform | Phase 1 |
+| `RB-VER-05` | Source cache TTL regression response | Steps to investigate and resolve a source cache miss rate spike; covers retrieval team escalation path, TTL configuration check, and temporary threshold adjustment for `unverified_claim` labelling | Backend Platform + Retrieval team | Phase 1 |
+| `RB-VER-06` | Verifier service GPU capacity emergency scale-out | Steps to manually trigger emergency GPU scale-out for the Semantic Verifier Service when the HPA has not responded to a traffic spike within 3 minutes; includes minimum replica override and cloud provider console steps | ML Platform + Infra | Phase 1 |
+| `RB-VER-07` | Audit API incident - unauthorized data access | Steps to disable the audit API endpoint, rotate affected API keys, and initiate privacy incident response if an unauthorized cross-account data access is detected in the audit API | Backend Platform + Privacy/Legal | Phase 2 |
+| `RB-VER-08` | Audit export disable and scope correction | Steps to disable the export endpoint, investigate a scope bug (export returning threads outside the requesting account's Space), and re-enable after the fix is confirmed | Backend Platform + Privacy/Legal | Phase 2 |
+| `RB-VER-09` | Cross-region verifier service divergence | Steps to resolve model version divergence between us-east-1 and eu-west-1 (e.g., after a failed simultaneous promotion); covers detecting divergence via per-region `verifier_model_version` metric, rolling back the diverged region, and confirming parity | ML Platform + Infra | Phase 2 |
+| `RB-VER-10` | `perplexity-claim-verifier-v1` production rollback | Steps to roll back from the proprietary model to `electra-base` within 5 minutes; covers model pointer update, pod restart, and accuracy health-check confirmation post-rollback | ML Platform | Phase 3 |
+| `RB-VER-11` | Free-tier `low_confidence` rate spike response | Steps to raise the `low_confidence` threshold for free-tier queries (from 0.65 to 0.70) without a full deployment; covers feature flag update, monitoring confirmation, and criteria for returning to the 0.65 threshold | ML Platform + Core Experience | Phase 3 |
+| `RB-VER-12` | Competitive benchmark retraction procedure | Steps to retract or correct the published competitive accuracy benchmark post; covers Legal and Communications coordination, blog post unpublishing, and methodology review timeline | Marketing/Research + Legal | Phase 3 |
 
 ---
 
